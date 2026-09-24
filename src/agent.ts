@@ -49,7 +49,14 @@ const USER_EMAIL = process.env.USER_EMAIL!;
 //     stdin/stdout. Handy for local dev, nothing to start first.
 const weatherTools = new MCPToolset(
   process.env.WEATHER_MCP_URL
-    ? { type: 'StreamableHTTPConnectionParams', url: process.env.WEATHER_MCP_URL }
+    ? {
+        type: 'StreamableHTTPConnectionParams',
+        url: process.env.WEATHER_MCP_URL,
+        // Deployed MCP (mcp/weather-mcp/serve.mjs) rejects calls without this token.
+        ...(process.env.WEATHER_MCP_TOKEN && {
+          transportOptions: { requestInit: { headers: { Authorization: `Bearer ${process.env.WEATHER_MCP_TOKEN}` } } },
+        }),
+      }
     : {
         type: 'StdioConnectionParams',
         serverParams: {
