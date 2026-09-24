@@ -1,0 +1,363 @@
+/**
+ * Handler for get_historical_weather tool
+ */
+
+import { NOAAService } from '../services/noaa.js';
+import { OpenMeteoService } from '../services/openmeteo.js';
+import { LocationStore } from '../services/locationStore.js';
+import { GeocodingService } from '../services/geocoding.js';
+import { resolveLocationAsync, prependLocationLine } from '../utils/locationResolver.js';
+import { validateHistoricalWeatherParams } from '../utils/validation.js';
+import { resolveUnitPreferences, UnitArgs } from '../utils/unitPreferences.js';
+import {
+  temperatureLabel,
+  windSpeedLabel,
+  precipitationLabel,
+  formatElevationFromM,
+  formatTemperatureQV,
+  formatWindSpeedQV,
+  formatPressureFromPa,
+  snowfallToPrecipUnit,
+} from '../utils/unitFormat.js';
+import { ApiConstants, FormatConstants, DisplayThresholds } from '../config/displayThresholds.js';
+import { isInUS } from '../utils/geography.js';
+import { DataNotFoundError, InvalidLocationError } from '../errors/ApiError.js';
+import { logger } from '../utils/logger.js';
+
+/** Note shown when an auto-routed NOAA request falls back to Open-Meteo. */
+const NOAA_FALLBACK_NOTE =
+  '*NOAA does not cover this location; showing Open-Meteo model data instead.*';
+
+/**
+ * Insert a note line directly under the output's top heading (first line),
+ * keeping the heading itself as the first thing the client renders.
+ */
+function insertNoteAfterHeading(text: string, note: string): string {
+  const newline = text.indexOf('\n');
+  if (newline === -1) {
+    return `${text}\n\n${note}\n`;
+  }
+  // The remainder starts with the original newline(s), so no trailing \n here.
+  return `${text.slice(0, newline)}\n\n${note}${text.slice(newline)}`;
+}
+
+/** Format signed coordinates with hemisphere labels (e.g. "32.8647°S, 70.1714°W"). */
+function formatCoordinates(latitude: number, longitude: number): string {
+  const lat = `${Math.abs(latitude).toFixed(4)}°${latitude >= 0 ? 'N' : 'S'}`;
+  const lon = `${Math.abs(longitude).toFixed(4)}°${longitude >= 0 ? 'E' : 'W'}`;
+  return `${lat}, ${lon}`;
+}
+
+export async function handleGetHistoricalWeather(
+  args: unknown,
+  noaaService: NOAAService,
+  openMeteoService: OpenMeteoService,
+  locationStore: LocationStore,
+  geocodingService: GeocodingService
+): Promise<{ content: Array<{ type: string; text: string }> }> {
+  // Resolve location first (coordinates, saved name, or geocoded city), then
+  // validate the date range. Coordinates from resolution are re-validated by
+  // validateHistoricalWeatherParams alongside the dates.
+  const resolved = await resolveLocationAsync(args as { latitude?: number; longitude?: number; location_name?: string; city_name?: string }, locationStore, geocodingService);
+  const { latitude, longitude, start_date, end_date, limit = FormatConstants.defaultHistoricalLimit } = validateHistoricalWeatherParams({
+    ...(args as Record<string, unknown>),
+    latitude: resolved.latitude,
+    longitude: resolved.longitude
+  });
+  const prefs = resolveUnitPreferences(args as UnitArgs);
+  const tempU = temperatureLabel(prefs);
+  const windU = windSpeedLabel(prefs);
+  const precipU = precipitationLabel(prefs);
+
+  // Parse dates
+  const startTime = new Date(start_date);
+  const endTime = new Date(end_date);
+
+  // Validate dates are not in the future
+  const now = new Date();
+  if (startTime > now) {
+    throw new Error(`Start date (${start_date}) cannot be in the future. Current date is ${now.toISOString().split('T')[0]}.`);
+  }
+  if (endTime > now) {
+    throw new Error(`End date (${end_date}) cannot be in the future. Current date is ${now.toISOString().split('T')[0]}.`);
+  }
+
+  // A date-only end_date parses to midnight UTC, which would make a same-day
+  // range (start_date === end_date) a zero-width observation window on the
+  // NOAA path. Extend date-only ends to cover the whole calendar day, clamped
+  // to now (NOAA rejects future end times). Open-Meteo receives the calendar
+  // dates directly and already treats them inclusively.
+  const noaaEndTime = end_date.includes('T')
+    ? endTime
+    : new Date(Math.min(endTime.getTime() + (24 * 60 * 60 * 1000 - 1), now.getTime()));
+
+  // Determine which API to use based on date range
+  // If start date is older than threshold, use archival API
+  const thresholdDate = new Date(now.getTime() - ApiConstants.historicalDataThresholdDays * 24 * 60 * 60 * 1000);
+  const useArchivalData = startTime < thresholdDate;
+
+  // NOAA's observation API only covers US stations, so recent dates route
+  // there only for US points. Everywhere else uses the Open-Meteo archive,
+  // which serves data through yesterday (verified live 2026-07-16 — recent
+  // days blend ERA5T/model data, no 5-day gap).
+  const useNOAA = !useArchivalData && isInUS(latitude, longitude);
+
+  const fetchFromOpenMeteo = async (
+    fallbackNote?: string
+  ): Promise<{ content: Array<{ type: string; text: string }> }> => {
+    // Use Open-Meteo API for historical/archival data
+    try {
+      // Determine whether to use hourly or daily data based on date range
+      const daysDiff = Math.ceil((endTime.getTime() - startTime.getTime()) / (1000 * 60 * 60 * 24));
+      const useHourly = daysDiff <= ApiConstants.maxHourlyHistoricalDays;
+
+      const weatherData = await openMeteoService.getHistoricalWeather(
+        latitude,
+        longitude,
+        start_date.split('T')[0], // Ensure YYYY-MM-DD format
+        end_date.split('T')[0],
+        useHourly,
+        prefs
+      );
+
+      // Format the response based on data granularity
+      if (useHourly && weatherData.hourly) {
+        // Format hourly observations. `limit` (default 168, ceiling 744 = 31
+        // days x 24h) applies only to this hourly branch; the daily-summary
+        // branch below always renders the full range.
+        const maxObservations = Math.min(limit, weatherData.hourly.time.length);
+        let output = `# Historical Weather Observations (Hourly)\n\n`;
+        // Use the requested date strings directly; constructing a Date and calling
+        // toLocaleDateString() would shift the displayed day in non-UTC server zones.
+        output += `**Period:** ${start_date.split('T')[0]} to ${end_date.split('T')[0]}\n`;
+        output += `**Location:** ${formatCoordinates(weatherData.latitude, weatherData.longitude)} (${formatElevationFromM(weatherData.elevation, prefs)} elevation)\n`;
+        output += `**Number of observations:** ${maxObservations}${maxObservations < weatherData.hourly.time.length ? ` (of ${weatherData.hourly.time.length} available)` : ''}\n`;
+        output += `**Data source:** Open-Meteo Historical Weather API (Reanalysis)\n\n`;
+
+        for (let i = 0; i < maxObservations; i++) {
+          const time = new Date(weatherData.hourly.time[i]);
+          output += `## ${time.toLocaleString()}\n`;
+
+          const temperature = weatherData.hourly.temperature_2m?.[i];
+          if (temperature != null) {
+            output += `- **Temperature:** ${Math.round(temperature)}${tempU}\n`;
+          }
+
+          const apparentTemperature = weatherData.hourly.apparent_temperature?.[i];
+          if (apparentTemperature != null) {
+            output += `- **Feels Like:** ${Math.round(apparentTemperature)}${tempU}\n`;
+          }
+
+          const weatherCode = weatherData.hourly.weather_code?.[i];
+          if (weatherCode != null) {
+            output += `- **Conditions:** ${openMeteoService.getWeatherDescription(weatherCode)}\n`;
+          }
+
+          const precipitation = weatherData.hourly.precipitation?.[i];
+          if (precipitation != null && precipitation > 0) {
+            output += `- **Precipitation:** ${precipitation.toFixed(2)} ${precipU}\n`;
+          }
+
+          const snowfall = weatherData.hourly.snowfall?.[i];
+          if (snowfall != null && snowfall > 0) {
+            output += `- **Snowfall:** ${snowfallToPrecipUnit(snowfall, prefs).toFixed(1)} ${precipU}\n`;
+          }
+
+          const windSpeed = weatherData.hourly.wind_speed_10m?.[i];
+          if (windSpeed != null) {
+            output += `- **Wind:** ${Math.round(windSpeed)} ${windU}`;
+            const windDirection = weatherData.hourly.wind_direction_10m?.[i];
+            if (windDirection != null) {
+              output += ` from ${Math.round(windDirection)}°`;
+            }
+            output += `\n`;
+          }
+
+          const relativeHumidity = weatherData.hourly.relative_humidity_2m?.[i];
+          if (relativeHumidity != null) {
+            output += `- **Humidity:** ${Math.round(relativeHumidity)}%\n`;
+          }
+
+          const pressureMsl = weatherData.hourly.pressure_msl?.[i];
+          if (pressureMsl != null) {
+            // Open-Meteo returns pressure_msl in hPa regardless of unit params
+            output += `- **Pressure:** ${formatPressureFromPa(pressureMsl * 100, prefs)}\n`;
+          }
+
+          const cloudCover = weatherData.hourly.cloud_cover?.[i];
+          if (cloudCover != null) {
+            output += `- **Cloud Cover:** ${cloudCover}%\n`;
+          }
+
+          output += `\n`;
+        }
+
+        return prependLocationLine({
+          content: [
+            {
+              type: 'text',
+              text: fallbackNote ? insertNoteAfterHeading(output, fallbackNote) : output
+            }
+          ]
+        }, resolved);
+      } else if (weatherData.daily) {
+        // Format daily summaries
+        let output = `# Historical Weather Data (Daily Summaries)\n\n`;
+        output += `**Period:** ${start_date.split('T')[0]} to ${end_date.split('T')[0]}\n`;
+        output += `**Location:** ${formatCoordinates(weatherData.latitude, weatherData.longitude)} (${formatElevationFromM(weatherData.elevation, prefs)} elevation)\n`;
+        output += `**Number of days:** ${weatherData.daily.time.length}\n`;
+        output += `**Data source:** Open-Meteo Historical Weather API (Reanalysis)\n\n`;
+
+        for (let i = 0; i < weatherData.daily.time.length; i++) {
+          const date = new Date(weatherData.daily.time[i]);
+          output += `## ${date.toLocaleDateString()}\n`;
+
+          const highTemp = weatherData.daily.temperature_2m_max?.[i];
+          if (highTemp != null) {
+            output += `- **High Temperature:** ${Math.round(highTemp)}${tempU}\n`;
+          }
+
+          const lowTemp = weatherData.daily.temperature_2m_min?.[i];
+          if (lowTemp != null) {
+            output += `- **Low Temperature:** ${Math.round(lowTemp)}${tempU}\n`;
+          }
+
+          const meanTemp = weatherData.daily.temperature_2m_mean?.[i];
+          if (meanTemp != null) {
+            output += `- **Average Temperature:** ${Math.round(meanTemp)}${tempU}\n`;
+          }
+
+          const dailyWeatherCode = weatherData.daily.weather_code?.[i];
+          if (dailyWeatherCode != null) {
+            output += `- **Conditions:** ${openMeteoService.getWeatherDescription(dailyWeatherCode)}\n`;
+          }
+
+          const precipitationSum = weatherData.daily.precipitation_sum?.[i];
+          if (precipitationSum != null) {
+            output += `- **Precipitation:** ${precipitationSum.toFixed(2)} ${precipU}\n`;
+          }
+
+          const snowfallSum = weatherData.daily.snowfall_sum?.[i];
+          if (snowfallSum != null && snowfallSum > 0) {
+            output += `- **Snowfall:** ${snowfallToPrecipUnit(snowfallSum, prefs).toFixed(1)} ${precipU}\n`;
+          }
+
+          const maxWindSpeed = weatherData.daily.wind_speed_10m_max?.[i];
+          if (maxWindSpeed != null) {
+            output += `- **Max Wind Speed:** ${Math.round(maxWindSpeed)} ${windU}\n`;
+          }
+
+          output += `\n`;
+        }
+
+        return prependLocationLine({
+          content: [
+            {
+              type: 'text',
+              text: fallbackNote ? insertNoteAfterHeading(output, fallbackNote) : output
+            }
+          ]
+        }, resolved);
+      } else {
+        throw new Error('No weather data available in response');
+      }
+    } catch (error) {
+      // If Open-Meteo API fails, provide helpful error message
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      throw new Error(`Unable to retrieve historical data: ${errorMessage}`);
+    }
+  };
+
+  if (!useNOAA) {
+    return fetchFromOpenMeteo();
+  }
+
+  try {
+    // Use real-time NOAA API for recent US data (last 7 days)
+    const observations = await noaaService.getHistoricalObservations(
+      latitude,
+      longitude,
+      startTime,
+      noaaEndTime,
+      limit
+    );
+
+    if (!observations.features || observations.features.length === 0) {
+      return prependLocationLine({
+        content: [
+          {
+            type: 'text',
+            text: `No historical observations found for the specified date range (${start_date} to ${end_date}).\n\nThis may occur because:\n- The dates are outside the station's available data range\n- There are gaps in the observation records for this location\n- The weather station near this location may not have archived data for these dates\n\nNote: Historical weather data availability varies by location and weather station. Some stations have limited historical records.`
+          }
+        ]
+      }, resolved);
+    }
+
+    // Format the observations
+    let output = `# Historical Weather Observations\n\n`;
+    output += `**Period:** ${start_date.split('T')[0]} to ${end_date.split('T')[0]}\n`;
+    output += `**Number of observations:** ${observations.features.length}\n`;
+    output += `**Data source:** NOAA Real-time API\n\n`;
+
+    for (const obs of observations.features) {
+      const props = obs.properties;
+      output += `## ${new Date(props.timestamp).toLocaleString()}\n`;
+
+      if (props.temperature.value !== null) {
+        output += `- **Temperature:** ${formatTemperatureQV(props.temperature, prefs)}\n`;
+      }
+
+      if (props.textDescription) {
+        output += `- **Conditions:** ${props.textDescription}\n`;
+      }
+
+      if (props.windSpeed.value !== null) {
+        output += `- **Wind:** ${formatWindSpeedQV(props.windSpeed, prefs)}\n`;
+      }
+
+      output += `\n`;
+    }
+
+    // NOAA's response gives no indication when the reporting station stopped
+    // updating mid-window — the observations simply stop. Find the newest
+    // timestamp across ALL features (the API does not guarantee sort order)
+    // and flag a gap against the requested (already-now-capped) end time.
+    let newestTimestamp = new Date(observations.features[0].properties.timestamp);
+    for (const obs of observations.features) {
+      const obsTime = new Date(obs.properties.timestamp);
+      if (obsTime.getTime() > newestTimestamp.getTime()) {
+        newestTimestamp = obsTime;
+      }
+    }
+    const gapMinutes = (noaaEndTime.getTime() - newestTimestamp.getTime()) / (60 * 1000);
+    if (gapMinutes > DisplayThresholds.currentConditions.staleWarningMinutes) {
+      output += `*Observations end ${newestTimestamp.toLocaleString()}; the reporting station may have gone offline.*\n\n`;
+    }
+
+    return prependLocationLine({
+      content: [
+        {
+          type: 'text',
+          text: output
+        }
+      ]
+    }, resolved);
+  } catch (error) {
+    // The US bounding boxes overrun the border (Toronto, Vancouver, Windsor
+    // all sit inside them), so recent-date points NOAA rejects fall back to
+    // the Open-Meteo archive instead of erroring — the same contract as
+    // get_current_conditions/get_forecast. NOAA maps the coverage 404 to
+    // DataNotFoundError and other 4xx to InvalidLocationError; both are
+    // non-retryable "NOAA can't serve this request" failures. Transient
+    // failures (RateLimitError, ServiceUnavailableError, network) propagate.
+    if (!(error instanceof DataNotFoundError || error instanceof InvalidLocationError)) {
+      throw error;
+    }
+    logger.warn('NOAA rejected recent-date historical location; falling back to Open-Meteo', {
+      latitude,
+      longitude,
+      fallback: true
+    });
+    return fetchFromOpenMeteo(NOAA_FALLBACK_NOTE);
+  }
+}

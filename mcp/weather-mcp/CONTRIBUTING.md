@@ -1,0 +1,236 @@
+# Contributing to Weather MCP Server
+
+Thank you for your interest in contributing to Weather MCP Server! This document provides guidelines and instructions for contributing.
+
+## Code of Conduct
+
+This project aims to foster an open and welcoming environment. Please be respectful and constructive in all interactions.
+
+## How to Contribute
+
+### Reporting Bugs
+
+If you find a bug, please open an issue on GitHub with:
+- A clear, descriptive title
+- Steps to reproduce the issue
+- Expected vs. actual behavior
+- Your environment (OS, Node.js version, etc.)
+- Any relevant error messages or logs
+
+### Suggesting Enhancements
+
+We welcome feature suggestions! Please open an issue with:
+- A clear description of the feature
+- The use case it addresses
+- Any implementation ideas (optional)
+
+### Pull Requests
+
+1. **Fork the repository** and create your branch from `main`
+2. **Make your changes** following the coding standards below
+3. **Test your changes** thoroughly
+4. **Update documentation** if needed
+5. **Submit a pull request** with a clear description
+
+## Development Setup
+
+1. Clone your fork:
+```bash
+git clone https://github.com/your-username/weather-mcp.git
+cd weather-mcp
+```
+
+2. Install dependencies:
+```bash
+npm install
+```
+
+3. Build the project:
+```bash
+npm run build
+```
+
+4. Run tests:
+```bash
+npx tsx tests/test_noaa_api.ts
+```
+
+## Coding Standards
+
+### TypeScript
+
+- Use TypeScript for all code
+- Enable strict mode (already configured)
+- Provide type annotations for function parameters and return values
+- Avoid using `any` type unless absolutely necessary
+
+### Code Style
+
+- Use 2 spaces for indentation
+- Use single quotes for strings
+- Add semicolons at the end of statements
+- Follow existing code patterns and conventions
+- Keep functions focused and single-purpose
+- Use descriptive variable and function names
+
+### Comments
+
+- Add comments for complex logic
+- Document public APIs and interfaces
+- Explain "why" not "what" in comments
+- Keep comments up-to-date with code changes
+
+### Error Handling
+
+- Always handle errors gracefully
+- Provide clear, user-friendly error messages
+- Log detailed errors for debugging (to stderr)
+- Never expose internal errors to end users
+
+## Project Structure
+
+```
+weather-mcp/
+├── src/
+│   ├── index.ts           # Stdio entry point
+│   ├── server/weatherServer.ts  # Tool registration, dispatch, services
+│   ├── services/
+│   │   ├── noaa.ts        # NOAA API service
+│   │   └── openmeteo.ts   # Open-Meteo historical weather API service
+│   ├── types/
+│   │   ├── noaa.ts        # NOAA TypeScript type definitions
+│   │   └── openmeteo.ts   # Open-Meteo TypeScript type definitions
+│   └── utils/
+│       └── units.ts       # Unit conversion utilities
+├── tests/                 # Test files
+│   ├── test_noaa_api.ts   # NOAA API test script
+│   ├── test_openmeteo.ts  # Open-Meteo API test script
+│   └── test_historical_mcp.ts  # Historical weather MCP test
+├── docs/                  # User-facing documentation
+│   ├── TOOLS.md           # Per-tool reference
+│   ├── CLIENT_SETUP.md    # Setup for 8 MCP clients
+│   └── testing/           # TESTING_GUIDE.md, TEST_SUITE_README.md
+└── dist/                  # Compiled output (generated)
+```
+
+## Testing
+
+### Before Submitting
+
+1. Run the build to check for TypeScript errors:
+```bash
+npm run build
+```
+
+2. Test with the NOAA API:
+```bash
+npx tsx tests/test_noaa_api.ts
+```
+
+3. Test manually with Claude Code (if possible)
+
+### Adding Tests
+
+When adding new features:
+- Add test cases to `tests/test_noaa_api.ts` for new service methods
+- Update `docs/testing/TESTING_GUIDE.md` with new manual test scenarios
+- Ensure all existing tests still pass
+
+## Documentation
+
+### When to Update Documentation
+
+Update documentation when you:
+- Add a new tool or feature
+- Change existing functionality
+- Fix a bug that affects usage
+- Improve performance significantly
+
+### Which Files to Update
+
+- `README.md` - For user-facing changes
+- `docs/TOOLS.md` - For any change to a tool's parameters or output
+- `docs/testing/TESTING_GUIDE.md` - For new test scenarios
+- `CHANGELOG.md` - Add an entry under `[Unreleased]`
+- Code comments - For implementation details
+
+## Commit Messages
+
+Write clear, descriptive commit messages:
+
+### Format
+```
+Brief description (50 chars or less)
+
+More detailed explanation if needed. Wrap at 72 characters.
+- Bullet points for multiple changes
+- Use present tense ("Add feature" not "Added feature")
+- Reference issues and PRs where relevant
+```
+
+### Examples
+
+Good:
+```
+Add support for hourly forecast
+
+Implement new tool for hourly weather forecasts using NOAA's
+hourly forecast endpoint. Includes error handling and tests.
+
+Fixes #123
+```
+
+Bad:
+```
+fixed stuff
+```
+
+## Release Process
+
+(For maintainers)
+
+Most of this is scripted. `./scripts/update-docs-for-release.sh <patch|minor|major|X.Y.Z>`
+does steps 1-2: it bumps `package.json` **and** `server.json` (which carries the version
+twice), promotes the `[Unreleased]` section of the root `CHANGELOG.md` into a dated
+`## [X.Y.Z]` section, writes that heading's `[X.Y.Z]:` compare-link definition, re-points
+`[Unreleased]:` at the new tag, and updates the version, tool-count and test-count
+references across the docs. Then `./scripts/check-doc-versions.sh` verifies the result.
+
+1. Run `./scripts/update-docs-for-release.sh <bump> ["one-line summary"]`, then review the
+   diff — especially the `CHANGELOG.md` wording, which is written for users of the server,
+   not for someone reading the commits.
+2. Commit: `git commit -m "chore: Release vX.Y.Z"`
+3. Push `main`: `git push origin main`
+4. Tag and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`
+5. Create the GitHub release, with notes taken from the new `CHANGELOG.md` section
+6. Publish to the MCP registry: `./mcp-publisher login github && ./mcp-publisher publish`
+
+**Do not run `npm publish` by hand.** Pushing the `vX.Y.Z` tag is what publishes the
+package: it triggers `.github/workflows/publish.yml`, which re-checks that the tag and both
+version fields agree, builds, tests, and publishes to npm with a provenance attestation via
+trusted publishing (OIDC — there is no npm token to hold). A hand-published tarball would
+carry no provenance and could silently disagree with the tag.
+
+Note that `docs/releases/CHANGELOG.md` is a frozen historical copy ending at 1.6.0. The
+canonical changelog is `CHANGELOG.md` at the repository root; add entries there, under
+`[Unreleased]`.
+
+## Questions?
+
+If you have questions about contributing:
+- Open an issue with the "question" label
+- Check existing issues and discussions
+- Review the code and documentation
+
+## License
+
+By contributing, you agree that your contributions will be licensed under the MIT License.
+
+## Recognition
+
+Contributors will be recognized in:
+- GitHub contributors list
+- Release notes for significant contributions
+- Special thanks in README for major features
+
+Thank you for contributing to Weather MCP Server!

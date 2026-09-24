@@ -1,0 +1,338 @@
+/**
+ * Unit tests for the get_weather_summary composite handler.
+ *
+ * The sub-handlers are mocked so these tests focus on the summary handler's own
+ * behavior: section selection, aggregation, single location resolution, and
+ * graceful degradation when a section fails.
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const currentMock = vi.fn();
+const forecastMock = vi.fn();
+const alertsMock = vi.fn();
+const airQualityMock = vi.fn();
+const lightningMock = vi.fn();
+
+vi.mock('../../src/handlers/currentConditionsHandler.js', () => ({
+  handleGetCurrentConditions: (...args: unknown[]) => currentMock(...args),
+}));
+vi.mock('../../src/handlers/forecastHandler.js', () => ({
+  handleGetForecast: (...args: unknown[]) => forecastMock(...args),
+}));
+vi.mock('../../src/handlers/alertsHandler.js', () => ({
+  handleGetAlerts: (...args: unknown[]) => alertsMock(...args),
+}));
+vi.mock('../../src/handlers/airQualityHandler.js', () => ({
+  handleGetAirQuality: (...args: unknown[]) => airQualityMock(...args),
+}));
+vi.mock('../../src/handlers/lightningHandler.js', () => ({
+  handleGetLightningActivity: (...args: unknown[]) => lightningMock(...args),
+}));
+
+import { handleGetWeatherSummary } from '../../src/handlers/weatherSummaryHandler.js';
+import { MqttUnavailableError, MQTT_UNAVAILABLE_MESSAGE } from '../../src/errors/ApiError.js';
+
+function textResult(text: string) {
+  return { content: [{ type: 'text', text }] };
+}
+
+const services = {
+  noaa: {} as any,
+  openMeteo: {} as any,
+  ncei: {} as any,
+  // Coordinate input means resolveLocationAsync never touches these
+  locationStore: {} as any,
+  geocoding: {} as any,
+};
+
+function callSummary(args: Record<string, unknown>) {
+  return handleGetWeatherSummary(
+    args,
+    services.noaa,
+    services.openMeteo,
+    services.ncei,
+    services.locationStore,
+    services.geocoding
+  );
+}
+
+describe('handleGetWeatherSummary', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    currentMock.mockResolvedValue(textResult('# Current Weather Conditions\nSunny'));
+    forecastMock.mockResolvedValue(textResult('# Weather Forecast (Daily)\nWarm'));
+    alertsMock.mockResolvedValue(textResult('# Weather Alerts\nNone'));
+    airQualityMock.mockResolvedValue(textResult('# Air Quality Report\nGood'));
+    lightningMock.mockResolvedValue(textResult('# Lightning Activity Report\nSafe'));
+  });
+
+  it('includes current, forecast, and alerts by default', async () => {
+    const result = await callSummary({ latitude: 47.6, longitude: -122.3 });
+    const text = result.content[0].text;
+
+    expect(text).toContain('# Weather Summary');
+    expect(text).toContain('**Includes:** current, forecast, alerts');
+    expect(text).toContain('Current Weather Conditions');
+    expect(text).toContain('Weather Forecast');
+    expect(text).toContain('Weather Alerts');
+
+    expect(currentMock).toHaveBeenCalledTimes(1);
+    expect(forecastMock).toHaveBeenCalledTimes(1);
+    expect(alertsMock).toHaveBeenCalledTimes(1);
+    expect(airQualityMock).not.toHaveBeenCalled();
+    expect(lightningMock).not.toHaveBeenCalled();
+  });
+
+  it('honors an explicit include list', async () => {
+    const result = await callSummary({
+      latitude: 47.6,
+      longitude: -122.3,
+      include: ['forecast', 'air_quality'],
+    });
+    const text = result.content[0].text;
+
+    expect(text).toContain('**Includes:** forecast, air_quality');
+    expect(forecastMock).toHaveBeenCalledTimes(1);
+    expect(airQualityMock).toHaveBeenCalledTimes(1);
+    expect(currentMock).not.toHaveBeenCalled();
+    expect(alertsMock).not.toHaveBeenCalled();
+  });
+
+  it('passes resolved coordinates (not a name) to every sub-handler', async () => {
+    await callSummary({ latitude: 47.6, longitude: -122.3 });
+
+    const firstCallArgs = forecastMock.mock.calls[0][0] as Record<string, unknown>;
+    expect(firstCallArgs.latitude).toBe(47.6);
+    expect(firstCallArgs.longitude).toBe(-122.3);
+    // location_name/city_name stripped so no sub-handler re-geocodes
+    expect(firstCallArgs.location_name).toBeUndefined();
+    expect(firstCallArgs.city_name).toBeUndefined();
+  });
+
+  it('degrades gracefully when a section fails', async () => {
+    // US location: alerts dispatches to the mocked handler (not short-circuited
+    // by the non-US pre-check below), so a thrown error still exercises the
+    // generic degrade-to-note path.
+    alertsMock.mockRejectedValue(new Error('alerts temporarily unavailable'));
+
+    const result = await callSummary({ latitude: 47.6062, longitude: -122.3321 });
+    const text = result.content[0].text;
+
+    expect(text).toContain('alerts (unavailable)');
+    expect(text).toContain('alerts temporarily unavailable');
+    // Other sections still render
+    expect(text).toContain('Current Weather Conditions');
+    expect(text).toContain('Weather Forecast');
+  });
+
+  it('dispatches handleGetAlerts for a non-US location instead of short-circuiting', async () => {
+    // Designed behaviour change (docs/plans/international-alerts-plan.md D7): alerts
+    // are no longer US-only in the summary handler. handleGetAlerts itself now
+    // routes by country and produces its own graceful output everywhere, so the
+    // summary calls it unconditionally, same as for a US location.
+    alertsMock.mockResolvedValue(textResult('# Weather Alerts — United Kingdom\nNone'));
+
+    const result = await callSummary({ latitude: 51.5074, longitude: -0.1278 }); // London
+    const text = result.content[0].text;
+
+    expect(alertsMock).toHaveBeenCalledTimes(1);
+    expect(text).toContain('Weather Alerts — United Kingdom');
+    expect(text).not.toContain('Weather alerts are currently available for US locations only.');
+    // Other sections still render normally
+    expect(text).toContain('Current Weather Conditions');
+    expect(text).toContain('Weather Forecast');
+  });
+
+  it('renders the alerts handler\'s not-covered message for an unsupported region', async () => {
+    // Simulates handleGetAlerts's own graceful "not covered" output (e.g. a
+    // region with no MeteoAlarm/GeoMet/NOAA coverage) flowing through the
+    // normal dispatch path unmodified.
+    alertsMock.mockResolvedValue(
+      textResult('# Weather Alerts\n\nWeather alerts are not yet available for this region.')
+    );
+
+    const result = await callSummary({ latitude: -33.8688, longitude: 151.2093 }); // Sydney
+    const text = result.content[0].text;
+
+    expect(alertsMock).toHaveBeenCalledTimes(1);
+    expect(text).toContain('Weather alerts are not yet available for this region.');
+    expect(text).not.toContain('alerts (unavailable)');
+    // Other sections still render normally
+    expect(text).toContain('Current Weather Conditions');
+    expect(text).toContain('Weather Forecast');
+  });
+
+  it('dispatches handleGetAlerts as before for a US location', async () => {
+    const result = await callSummary({ latitude: 47.6062, longitude: -122.3321 }); // Seattle
+    const text = result.content[0].text;
+
+    expect(alertsMock).toHaveBeenCalledTimes(1);
+    expect(text).toContain('Weather Alerts');
+    expect(text).not.toContain('Weather alerts are currently available for US locations only.');
+  });
+
+  it('rejects an invalid include entry', async () => {
+    await expect(
+      callSummary({ latitude: 47.6, longitude: -122.3, include: ['forecast', 'bogus'] })
+    ).rejects.toThrow(/invalid include/i);
+  });
+
+  it('falls back to defaults for an empty include array', async () => {
+    await callSummary({ latitude: 47.6, longitude: -122.3, include: [] });
+
+    expect(currentMock).toHaveBeenCalledTimes(1);
+    expect(forecastMock).toHaveBeenCalledTimes(1);
+    expect(alertsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('degrades lightning to an honest unavailable note on MqttUnavailableError, never a fabricated all-clear', async () => {
+    // The optional `mqtt` package can be absent (see src/services/blitzortung.ts,
+    // T1/T3 of the optional-mqtt-dependency plan). That must never surface here as
+    // "no lightning strikes" or any other calm-sounding result — lightning is
+    // safety data, so an absent dependency degrades the same way any other
+    // section failure does: an honest "(unavailable)" note with the real reason,
+    // via the generic per-section catch in weatherSummaryHandler.ts.
+    lightningMock.mockRejectedValue(new MqttUnavailableError());
+
+    const result = await callSummary({
+      latitude: 47.6,
+      longitude: -122.3,
+      include: ['lightning'],
+    });
+    const text = result.content[0].text;
+
+    expect((result as { isError?: boolean }).isError).not.toBe(true);
+    expect(text).toContain('## lightning (unavailable)');
+    // Assert against the exported constant, never a hand-copied literal, so a
+    // reword of the message can't silently desync this test. It names the
+    // package and states the remedy.
+    expect(text).toContain(MQTT_UNAVAILABLE_MESSAGE);
+    expect(text).toContain('mqtt');
+    expect(text).toContain('Reinstall without --omit=optional');
+
+    const lower = text.toLowerCase();
+    expect(lower).not.toMatch(/no lightning strikes/);
+    expect(lower).not.toMatch(/all[- ]clear/);
+    expect(lower).not.toMatch(/\bsafe\b/);
+  });
+});
+
+describe('D9: compare_models stripped from weather-summary sub-requests', () => {
+  it('never invokes getModelComparison and renders the standard forecast shape', async () => {
+    // Every other test in this file relies on the module-level mock of
+    // forecastHandler.js, which would make "getModelComparison never called"
+    // trivially true regardless of whether the strip actually works. This
+    // lock test needs the REAL handleGetForecast so a regression in the
+    // strip would genuinely route into the comparison branch and call
+    // getModelComparison — so it unmocks forecastHandler.js and re-imports
+    // fresh, using a local Open-Meteo fake instead of the shared mocks above.
+    vi.doUnmock('../../src/handlers/forecastHandler.js');
+    vi.resetModules();
+
+    const { handleGetWeatherSummary: freshHandleGetWeatherSummary } = await import(
+      '../../src/handlers/weatherSummaryHandler.js'
+    );
+
+    const getModelComparisonMock = vi.fn();
+    const fakeOpenMeteo = {
+      getForecast: vi.fn().mockResolvedValue({
+        elevation: 10,
+        timezone: 'Europe/London',
+        daily: { time: ['2026-08-16'] },
+      }),
+      getModelComparison: getModelComparisonMock,
+      getWeatherDescription: vi.fn().mockReturnValue('Clear'),
+    } as any;
+
+    try {
+      const result = await freshHandleGetWeatherSummary(
+        {
+          // London — non-US, so the real forecast handler auto-routes
+          // straight to Open-Meteo without touching NOAA at all.
+          latitude: 51.5074,
+          longitude: -0.1278,
+          include: ['forecast'],
+          compare_models: true,
+        },
+        {} as any, // noaaService — never touched on this non-US path
+        fakeOpenMeteo,
+        {} as any, // nceiService
+        {} as any, // locationStore
+        {} as any // geocodingService
+      );
+      const text = result.content[0].text;
+
+      expect(getModelComparisonMock).not.toHaveBeenCalled();
+      expect(fakeOpenMeteo.getForecast).toHaveBeenCalledTimes(1);
+      expect(text).toContain('# Weather Forecast (Daily)');
+      expect(text).not.toContain('Model Comparison');
+    } finally {
+      // Restore the shared module mock so it can't leak into any test that
+      // runs after this one in the same worker process.
+      vi.doMock('../../src/handlers/forecastHandler.js', () => ({
+        handleGetForecast: (...args: unknown[]) => forecastMock(...args),
+      }));
+    }
+  });
+});
+
+describe('D9: ensemble_spread stripped from weather-summary sub-requests', () => {
+  it('never invokes getEnsembleSpread and renders the standard forecast shape', async () => {
+    // Same caveat as the compare_models lock test above: every other test in
+    // this file relies on the module-level mock of forecastHandler.js, which
+    // would make "getEnsembleSpread never called" trivially true regardless of
+    // whether the strip actually works. This lock test needs the REAL
+    // handleGetForecast so a regression in the strip would genuinely route
+    // into the ensemble-spread branch and call getEnsembleSpread — so it
+    // unmocks forecastHandler.js and re-imports fresh, using a local
+    // Open-Meteo fake instead of the shared mocks above.
+    vi.doUnmock('../../src/handlers/forecastHandler.js');
+    vi.resetModules();
+
+    const { handleGetWeatherSummary: freshHandleGetWeatherSummary } = await import(
+      '../../src/handlers/weatherSummaryHandler.js'
+    );
+
+    const getEnsembleSpreadMock = vi.fn();
+    const fakeOpenMeteo = {
+      getForecast: vi.fn().mockResolvedValue({
+        elevation: 10,
+        timezone: 'Europe/London',
+        daily: { time: ['2026-08-16'] },
+      }),
+      getEnsembleSpread: getEnsembleSpreadMock,
+      getWeatherDescription: vi.fn().mockReturnValue('Clear'),
+    } as any;
+
+    try {
+      const result = await freshHandleGetWeatherSummary(
+        {
+          // London — non-US, so the real forecast handler auto-routes
+          // straight to Open-Meteo without touching NOAA at all.
+          latitude: 51.5074,
+          longitude: -0.1278,
+          include: ['forecast'],
+          ensemble_spread: true,
+        },
+        {} as any, // noaaService — never touched on this non-US path
+        fakeOpenMeteo,
+        {} as any, // nceiService
+        {} as any, // locationStore
+        {} as any // geocodingService
+      );
+      const text = result.content[0].text;
+
+      expect(getEnsembleSpreadMock).not.toHaveBeenCalled();
+      expect(fakeOpenMeteo.getForecast).toHaveBeenCalledTimes(1);
+      expect(text).toContain('# Weather Forecast (Daily)');
+      expect(text).not.toContain('# Weather Forecast (Ensemble Spread)');
+    } finally {
+      // Restore the shared module mock so it can't leak into any test that
+      // runs after this one in the same worker process.
+      vi.doMock('../../src/handlers/forecastHandler.js', () => ({
+        handleGetForecast: (...args: unknown[]) => forecastMock(...args),
+      }));
+    }
+  });
+});

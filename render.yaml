@@ -1,0 +1,72 @@
+# Render Blueprint: the agent and the weather MCP as two separate services,
+# both on Render's native Node runtime (no Docker).
+# Render dashboard → New → Blueprint → pick this repo.
+
+services:
+  # The weather MCP (source in mcp/weather-mcp/). A *private* service:
+  # reachable only by other services on this Render account, never from the
+  # internet — so nobody can call its tools directly and skip ArmorIQ.
+  # Private services have no free plan.
+  - type: pserv
+    name: weather-mcp
+    runtime: node
+    plan: 0.5c-512mb
+    region: singapore
+    buildCommand: >-
+      cd mcp/weather-mcp &&
+      npm ci --include=dev &&
+      npm run build &&
+      npm install --no-save supergateway@4.0.0
+    # supergateway serves the stdio-only server as Streamable HTTP at /mcp.
+    startCommand: >-
+      cd mcp/weather-mcp &&
+      npx supergateway --stdio "node dist/index.js"
+      --outputTransport streamableHttp --streamableHttpPath /mcp
+      --stateful --sessionTimeout 300000 --healthEndpoint /healthz
+      --port ${PORT:-10000}
+    buildFilter:
+      paths:
+        - mcp/weather-mcp/**
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # "standard" turns on the saved-location tools (save/list/get/remove).
+      - key: ENABLED_TOOLS
+        value: standard
+
+  # The agent: ADK dev UI + ArmorIQ. Public URL.
+  # Free plan sleeps after ~15 min idle (first request then takes ~1 min);
+  # switch to 0.5c-512mb before a live demo.
+  - type: web
+    name: weather-agent
+    runtime: node
+    plan: free
+    region: singapore
+    # Dev dependencies on purpose: the `adk` CLI lives in @google/adk-devtools.
+    buildCommand: npm ci --include=dev
+    # WEATHER_MCP_HOSTPORT (e.g. weather-mcp:10000) → the MCP's private URL.
+    startCommand: >-
+      WEATHER_MCP_URL="http://$WEATHER_MCP_HOSTPORT/mcp"
+      npx adk web agents --host 0.0.0.0 --port $PORT
+    buildFilter:
+      ignoredPaths:
+        - mcp/**
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: WEATHER_MCP_HOSTPORT
+        fromService:
+          type: pserv
+          name: weather-mcp
+          property: hostport
+      - key: GEMINI_MODEL
+        value: gemini-3.1-flash-lite
+      # Secrets — Render asks for these when you create the Blueprint.
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: ARMORIQ_API_KEY
+        sync: false
+      - key: USER_EMAIL
+        sync: false

@@ -1,0 +1,252 @@
+/**
+ * Handler for get_weather_summary tool
+ *
+ * A composite tool that answers broad "what's the weather like?" questions in a
+ * single call by aggregating several specialized tools (current conditions,
+ * forecast, alerts, and optionally air quality and lightning) for one location.
+ * Location is resolved once and the resolved coordinates are passed to each
+ * sub-handler so there is no repeated geocoding.
+ */
+
+import { NOAAService } from '../services/noaa.js';
+import { OpenMeteoService } from '../services/openmeteo.js';
+import { NCEIService } from '../services/ncei.js';
+import { LocationStore } from '../services/locationStore.js';
+import { GeocodingService } from '../services/geocoding.js';
+import { MeteoAlarmService } from '../services/meteoalarm.js';
+import { GeoMetService } from '../services/geomet.js';
+import { NominatimService } from '../services/nominatim.js';
+import { GoogleWeatherService } from '../services/googleWeather.js';
+import { NationalCapService } from '../services/nationalCap.js';
+import { resolveLocationAsync, formatLocationLine } from '../utils/locationResolver.js';
+import { validateDetail, validateForecastDays, DetailLevel } from '../utils/validation.js';
+import { logger } from '../utils/logger.js';
+import { handleGetCurrentConditions } from './currentConditionsHandler.js';
+import { handleGetForecast } from './forecastHandler.js';
+import { handleGetAlerts } from './alertsHandler.js';
+import { JmaService } from '../services/jma.js';
+import { MetnoService } from '../services/metno.js';
+import { handleGetAirQuality } from './airQualityHandler.js';
+import { handleGetLightningActivity } from './lightningHandler.js';
+import { resolveCriticalAlertBanner } from './criticalAlertBanner.js';
+import { guessTimezoneFromCoords } from '../utils/timezone.js';
+
+/**
+ * Sections that can be included in a weather summary.
+ */
+export type SummarySection = 'current' | 'forecast' | 'alerts' | 'air_quality' | 'lightning';
+
+const VALID_SECTIONS: SummarySection[] = ['current', 'forecast', 'alerts', 'air_quality', 'lightning'];
+const DEFAULT_SECTIONS: SummarySection[] = ['current', 'forecast', 'alerts'];
+
+interface WeatherSummaryArgs {
+  latitude?: number;
+  longitude?: number;
+  location_name?: string;
+  city_name?: string;
+  include?: unknown;
+  detail?: DetailLevel;
+  days?: number;
+}
+
+/**
+ * Validate and normalize the `include` array.
+ * Defaults to current + forecast + alerts; unknown entries are rejected.
+ */
+function validateInclude(value: unknown): SummarySection[] {
+  if (value === undefined) {
+    return DEFAULT_SECTIONS;
+  }
+
+  if (!Array.isArray(value)) {
+    throw new Error('include must be an array of section names');
+  }
+
+  const sections: SummarySection[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string' || !VALID_SECTIONS.includes(entry as SummarySection)) {
+      throw new Error(
+        `Invalid include entry "${entry}". Valid sections: ${VALID_SECTIONS.join(', ')}.`
+      );
+    }
+    if (!sections.includes(entry as SummarySection)) {
+      sections.push(entry as SummarySection);
+    }
+  }
+
+  // Empty array falls back to the default set rather than producing an empty report
+  return sections.length > 0 ? sections : DEFAULT_SECTIONS;
+}
+
+/**
+ * Extract the text payload from a sub-handler result.
+ */
+function textOf(result: { content: Array<{ type: string; text: string }> }): string {
+  return result.content
+    .filter(block => block.type === 'text')
+    .map(block => block.text)
+    .join('\n');
+}
+
+export async function handleGetWeatherSummary(
+  args: unknown,
+  noaaService: NOAAService,
+  openMeteoService: OpenMeteoService,
+  nceiService: NCEIService,
+  locationStore: LocationStore,
+  geocodingService: GeocodingService,
+  meteoAlarmService?: MeteoAlarmService,
+  geoMetService?: GeoMetService,
+  nominatimService?: NominatimService,
+  googleWeatherService?: GoogleWeatherService,
+  nationalCapService?: NationalCapService,
+  // Trailing and optional, exactly as on `handleGetAlerts`, so every
+  // pre-existing 11-argument call site passes `undefined` and is unchanged.
+  //
+  // Routing reaches the summary automatically; the *dependency* does not. A new
+  // service parameter on `handleGetAlerts` arrives `undefined` from here unless
+  // it is threaded explicitly, which would silently render a Japanese point
+  // through Google or the not-covered sentence — a fabricated all-clear on
+  // safety data (G19, and both prep-review legs filed it).
+  jmaService?: JmaService,
+  // The critical-alert banner runs the hazard the other way round. Every other
+  // trailing parameter here has to be threaded *down* or its feature is missing
+  // from the summary; this one must NOT be, because the summary already renders
+  // the forecast and current-conditions sections through the same handlers that
+  // now carry the flag. Thread it into either of those two calls below and the
+  // banner renders three times in one response — a safety element repeated is a
+  // safety element people stop reading.
+  //
+  // The summary therefore resolves the banner **once, here**, and prepends it to
+  // its own assembled body. Two facts already keep the sub-handlers quiet: both
+  // calls below pass 6 arguments, so a trailing 8th/9th arrives `undefined`; and
+  // `subArgs` is spread from the caller's `args`, while this is a function
+  // parameter and not a member of `args`. Neither survives a future edit
+  // unnoticed, which is why `tests/unit/critical-alert-summary.test.ts` counts
+  // the banner's occurrences rather than merely asserting it is present.
+  criticalAlertBanner?: boolean,
+  // Threaded *down*, like every trailing parameter above except the banner: the
+  // summary renders its forecast section through `handleGetForecast`, so the
+  // Open-Meteo outage fallback is dead on this path unless the service arrives
+  // here and is forwarded. This is the path a default install actually
+  // exercises, so "the summary inherits it through the shared formatter" is the
+  // exact assumption G19 exists to refuse.
+  metnoService?: MetnoService
+): Promise<{ content: Array<{ type: string; text: string }> }> {
+  const typedArgs = (args ?? {}) as WeatherSummaryArgs;
+
+  // Resolve location once; sub-handlers receive the resolved coordinates so they
+  // never re-geocode (coordinates take precedence in resolveLocationAsync).
+  const resolved = await resolveLocationAsync(typedArgs, locationStore, geocodingService);
+  const include = validateInclude(typedArgs.include);
+  const detail = validateDetail(typedArgs.detail, 'summary');
+  const days = validateForecastDays(typedArgs);
+
+  // Shared args for every sub-handler: resolved coordinates plus pass-through of
+  // unit preferences and detail. Coordinates override any name so no geocoding.
+  const subArgs = {
+    ...(typeof args === 'object' && args !== null ? args : {}),
+    latitude: resolved.latitude,
+    longitude: resolved.longitude,
+    location_name: undefined,
+    city_name: undefined,
+    // A comparison block is the wrong shape inside a summary; users wanting
+    // a comparison call get_forecast directly.
+    compare_models: undefined,
+    // Same reasoning as compare_models (D9): the summary's forecast section is
+    // a plain forecast, and a spread view would replace that section with a
+    // different product rather than compose with the summary's other sections.
+    ensemble_spread: undefined,
+    detail
+  };
+
+  // Resolved once for the whole summary and prepended outermost, so the reader
+  // meets the warning before the heading. The summary builds a string rather
+  // than mutating `content[0].text`, so this is plain concatenation and
+  // `prependCriticalAlertBanner` is not used at this site.
+  //
+  // The falsy flag short-circuits before the `await`, so the no-flag path gains
+  // no latency at all.
+  const criticalBanner = criticalAlertBanner
+    ? await resolveCriticalAlertBanner(
+        noaaService,
+        resolved,
+        guessTimezoneFromCoords(resolved.latitude, resolved.longitude)
+      )
+    : '';
+
+  let body = `${criticalBanner}# Weather Summary\n\n`;
+  const locationLine = formatLocationLine(resolved);
+  if (locationLine) {
+    body += locationLine;
+  } else {
+    body += `**Location:** ${resolved.latitude.toFixed(4)}, ${resolved.longitude.toFixed(4)}\n\n`;
+  }
+  body += `**Includes:** ${include.join(', ')}\n\n`;
+  body += `---\n\n`;
+
+  // Run each requested section. A section failure (e.g. an upstream error)
+  // degrades to a note instead of failing the whole summary. Alerts are no
+  // longer US-only here — handleGetAlerts routes by country itself and
+  // produces its own graceful "not covered" message where needed.
+  for (const section of include) {
+    try {
+      let sectionResult: { content: Array<{ type: string; text: string }> };
+      switch (section) {
+        case 'current':
+          sectionResult = await handleGetCurrentConditions(
+            subArgs, noaaService, openMeteoService, nceiService, locationStore, geocodingService
+          );
+          break;
+        case 'forecast':
+          // **The two `undefined`s are load-bearing and are not padding.**
+          // This call deliberately drops `acisService` (7th) and
+          // `criticalAlertBanner` (8th) — the banner because the summary
+          // renders it once itself, above its own header. `metnoService` is
+          // the 9th parameter, so appending it here would bind it to
+          // `acisService` instead: a strict-type failure at best, and a
+          // service handed to the wrong slot at worst. Count the omitted
+          // parameters rather than trusting the tail.
+          sectionResult = await handleGetForecast(
+            { ...subArgs, days }, noaaService, openMeteoService, locationStore, geocodingService,
+            nceiService, undefined, undefined, metnoService
+          );
+          break;
+        case 'alerts':
+          sectionResult = await handleGetAlerts(
+            subArgs, noaaService, locationStore, geocodingService,
+            meteoAlarmService, geoMetService, nominatimService, googleWeatherService,
+            nationalCapService, jmaService
+          );
+          break;
+        case 'air_quality':
+          sectionResult = await handleGetAirQuality(subArgs, openMeteoService, locationStore, geocodingService);
+          break;
+        case 'lightning':
+          sectionResult = await handleGetLightningActivity(subArgs, locationStore, geocodingService);
+          break;
+        default:
+          continue;
+      }
+      body += textOf(sectionResult).trim();
+      body += `\n\n---\n\n`;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.warn('Weather summary section failed', { section, error: message });
+      body += `## ${section} (unavailable)\n\n`;
+      body += `⚠️ Could not retrieve ${section} data for this location: ${message}\n\n`;
+      body += `---\n\n`;
+    }
+  }
+
+  body += `*Composite summary. Use the individual tools (get_forecast, get_current_conditions, get_alerts, ...) for deeper detail.*\n`;
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: body
+      }
+    ]
+  };
+}

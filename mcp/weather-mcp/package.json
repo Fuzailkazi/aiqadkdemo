@@ -1,0 +1,100 @@
+{
+  "name": "@dangahagan/weather-mcp",
+  "version": "1.31.3",
+  "description": "MCP server giving AI assistants 17 weather tools with zero API keys: global forecasts, current conditions, alerts, air quality, marine conditions, lightning detection, radar imagery, river levels, wildfire tracking, and historical weather back to 1940. Built entirely on free public APIs (NOAA, Open-Meteo, USGS, NIFC).",
+  "mcpName": "io.github.dgahagan/weather-mcp",
+  "main": "dist/index.js",
+  "type": "module",
+  "bin": {
+    "weather-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "prepublishOnly": "npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:ui": "vitest --ui",
+    "audit": "npm audit --audit-level=moderate",
+    "audit:fix": "npm audit fix",
+    "stress": "node scripts/stress-harness.mjs",
+    "examples": "node scripts/capture-examples.mjs",
+    "generate:jma-areas": "node scripts/generate-jma-areas.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "weather",
+    "weather-api",
+    "weather-forecast",
+    "noaa",
+    "open-meteo",
+    "forecast",
+    "climate",
+    "historical-weather",
+    "weather-alerts",
+    "air-quality",
+    "marine-weather",
+    "lightning",
+    "weather-radar",
+    "wildfire",
+    "geocoding",
+    "no-api-key",
+    "free",
+    "claude",
+    "claude-code",
+    "cursor",
+    "ai",
+    "llm",
+    "ai-tools"
+  ],
+  "author": "Dan Gahagan",
+  "license": "MIT",
+  "homepage": "https://github.com/weather-mcp/weather-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/weather-mcp/weather-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/weather-mcp/weather-mcp/issues"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "astronomy-engine": "^2.1.19",
+    "axios": "^1.20.0",
+    "dotenv": "^17.2.3",
+    "fast-xml-parser": "^5.11.1",
+    "luxon": "^3.7.2",
+    "ngeohash": "^0.6.4",
+    "pngjs": "^7.0.0",
+    "tz-lookup": "^6.1.25"
+  },
+  "optionalDependencies": {
+    "mqtt": "^5.14.1"
+  },
+  "overrides": {
+    "fast-uri": "3.1.6"
+  },
+  "devDependencies": {
+    "@types/luxon": "^3.7.5",
+    "@types/ngeohash": "^0.6.8",
+    "@types/node": "^26.5.1",
+    "@types/pngjs": "^6.0.5",
+    "@types/tz-lookup": "^6.1.2",
+    "@vitest/coverage-v8": "^5.0.0",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
+  }
+}

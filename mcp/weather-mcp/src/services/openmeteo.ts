@@ -1,0 +1,1970 @@
+/**
+ * Service for interacting with the Open-Meteo APIs
+ * Documentation:
+ * - Historical Weather: https://open-meteo.com/en/docs/historical-weather-api
+ * - Forecast: https://open-meteo.com/en/docs
+ * - Geocoding: https://open-meteo.com/en/docs/geocoding-api
+ * - Air Quality: https://open-meteo.com/en/docs/air-quality-api
+ * - Marine: https://open-meteo.com/en/docs/marine-weather-api
+ */
+
+import axios, { AxiosInstance, AxiosError } from 'axios';
+import type {
+  OpenMeteoHistoricalResponse,
+  OpenMeteoErrorResponse,
+  GeocodingResponse,
+  OpenMeteoForecastResponse,
+  OpenMeteoAirQualityResponse,
+  OpenMeteoMarineResponse,
+  OpenMeteoFloodResponse,
+  OpenMeteoModelComparisonResponse,
+  OpenMeteoEnsembleResponse,
+  ClimateNormals
+} from '../types/openmeteo.js';
+import { Cache } from '../utils/cache.js';
+import { CacheConfig, getHistoricalDataTTL } from '../config/cache.js';
+import { validateLatitude, validateLongitude } from '../utils/validation.js';
+import { logger, redactCoordinatesForLogging } from '../utils/logger.js';
+import { computeNormalsTable, getNormalsTableCacheKey, type NormalsTable } from '../utils/normals.js';
+import { getUserAgent } from '../utils/version.js';
+import { UnitPreferences, IMPERIAL_PREFERENCES } from '../config/units.js';
+import { openMeteoUnitParams } from '../utils/unitFormat.js';
+import { COMPARISON_MODELS } from '../utils/modelComparison.js';
+import { ENSEMBLE_MODEL } from '../utils/ensembleSpread.js';
+import {
+  RateLimitError,
+  ServiceUnavailableError,
+  InvalidLocationError,
+  DataNotFoundError,
+  ApiError
+} from '../errors/ApiError.js';
+
+/**
+ * Compact signature of the unit preferences that affect an Open-Meteo request,
+ * used to keep cache entries for different unit systems distinct.
+ */
+function unitSignature(prefs: UnitPreferences): string {
+  return `${prefs.temperature}-${prefs.windSpeed}-${prefs.precipitation}`;
+}
+
+/**
+ * Bounded 429 posture for the climate-normals archive pull (D3).
+ *
+ * Open-Meteo weights archive calls by period length, so a full-year normals
+ * pull is comparatively expensive; the limit was observed live once and did
+ * not reproduce across three consecutive 30-year pulls. One retry is the
+ * defensive sizing that matches that evidence — a second 429 propagates to
+ * the call site's existing catch, which renders the unavailable note.
+ */
+const NORMALS_RETRY_DELAY_MS = 2000;
+const NORMALS_RETRY_JITTER_MS = 500;
+
+export interface OpenMeteoServiceConfig {
+  baseURL?: string;
+  geocodingURL?: string;
+  forecastURL?: string;
+  airQualityURL?: string;
+  marineURL?: string;
+  floodURL?: string;
+  ensembleURL?: string;
+  timeout?: number;
+  maxRetries?: number;
+}
+
+export class OpenMeteoService {
+  private client: AxiosInstance;
+  private geocodingClient: AxiosInstance;
+  private forecastClient: AxiosInstance;
+  private airQualityClient: AxiosInstance;
+  private marineClient: AxiosInstance;
+  private floodClient: AxiosInstance;
+  private ensembleClient: AxiosInstance;
+  private maxRetries: number;
+  private cache: Cache;
+
+  /**
+   * In-flight climate-normals table pulls, keyed by the table cache key (D3).
+   *
+   * `get_weather_summary` spreads the caller's args into every sub-handler, so
+   * `include_normals: true` fans out to the forecast and current-conditions
+   * handlers **concurrently** for the same coordinates — without this map both
+   * would miss the (not-yet-populated) cache and each issue a full-year
+   * archive pull. Entries are removed once settled, so a rejected pull is
+   * never cached and never left behind for the next caller to join.
+   */
+  private normalsTableInFlight = new Map<string, Promise<NormalsTable>>();
+
+  constructor(config: OpenMeteoServiceConfig = {}) {
+    const {
+      baseURL = 'https://archive-api.open-meteo.com/v1',
+      geocodingURL = 'https://geocoding-api.open-meteo.com/v1',
+      forecastURL = 'https://api.open-meteo.com/v1',
+      airQualityURL = 'https://air-quality-api.open-meteo.com/v1',
+      marineURL = 'https://marine-api.open-meteo.com/v1',
+      floodURL = 'https://flood-api.open-meteo.com/v1',
+      // The ensemble API is its own subdomain, distinct from the plain
+      // forecast host (D3) — a single model's perturbed-member daily
+      // aggregates are a different product from both a plain forecast and
+      // the multi-model comparison, both of which stay on forecastURL.
+      ensembleURL = 'https://ensemble-api.open-meteo.com/v1',
+      timeout = CacheConfig.apiTimeoutMs,
+      maxRetries = 3
+    } = config;
+
+    this.maxRetries = maxRetries;
+    this.cache = new Cache(CacheConfig.maxSize);
+
+    // Historical weather client
+    this.client = axios.create({
+      baseURL,
+      timeout,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': getUserAgent()
+      }
+    });
+
+    // Geocoding client
+    this.geocodingClient = axios.create({
+      baseURL: geocodingURL,
+      timeout,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': getUserAgent()
+      }
+    });
+
+    // Forecast client
+    this.forecastClient = axios.create({
+      baseURL: forecastURL,
+      timeout,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': getUserAgent()
+      }
+    });
+
+    // Air quality client
+    this.airQualityClient = axios.create({
+      baseURL: airQualityURL,
+      timeout,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': getUserAgent()
+      }
+    });
+
+    // Marine client
+    this.marineClient = axios.create({
+      baseURL: marineURL,
+      timeout,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': getUserAgent()
+      }
+    });
+
+    // Flood client (river discharge / GloFAS)
+    this.floodClient = axios.create({
+      baseURL: floodURL,
+      timeout,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': getUserAgent()
+      }
+    });
+
+    // Ensemble client (single-model member spread)
+    this.ensembleClient = axios.create({
+      baseURL: ensembleURL,
+      timeout,
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': getUserAgent()
+      }
+    });
+
+    // Add response interceptor for error handling
+    this.client.interceptors.response.use(
+      response => response,
+      error => this.handleError(error)
+    );
+
+    this.geocodingClient.interceptors.response.use(
+      response => response,
+      error => this.handleError(error)
+    );
+
+    this.forecastClient.interceptors.response.use(
+      response => response,
+      error => this.handleError(error)
+    );
+
+    this.airQualityClient.interceptors.response.use(
+      response => response,
+      error => this.handleError(error)
+    );
+
+    this.marineClient.interceptors.response.use(
+      response => response,
+      error => this.handleError(error)
+    );
+
+    this.floodClient.interceptors.response.use(
+      response => response,
+      error => this.handleError(error)
+    );
+
+    this.ensembleClient.interceptors.response.use(
+      response => response,
+      error => this.handleError(error)
+    );
+  }
+
+  /**
+   * Handle API errors with helpful status information
+   */
+  private async handleError(error: AxiosError): Promise<never> {
+    if (error.response) {
+      const status = error.response.status;
+      const data = error.response.data as OpenMeteoErrorResponse;
+
+      // Bad request
+      if (status === 400) {
+        const reason = data.reason || 'Invalid request parameters';
+        logger.warn('Invalid request parameters', {
+          service: 'OpenMeteo',
+          reason,
+          securityEvent: true
+        });
+        throw new InvalidLocationError(
+          'OpenMeteo',
+          `${reason}\n\nPlease verify:\n` +
+          `- Coordinates are valid (latitude: -90 to 90, longitude: -180 to 180)\n` +
+          `- Date range is valid (1940 to 5 days ago)\n` +
+          `- Parameters are correctly formatted`
+        );
+      }
+
+      // Rate limit error
+      if (status === 429) {
+        logger.warn('Rate limit exceeded', {
+          service: 'OpenMeteo',
+          securityEvent: true
+        });
+        throw new RateLimitError('OpenMeteo');
+      }
+
+      // Server errors
+      if (status >= 500) {
+        throw new ServiceUnavailableError('OpenMeteo', error);
+      }
+
+      // Other errors
+      throw new ApiError(
+        `Open-Meteo API error (${status})`,
+        status,
+        'OpenMeteo',
+        data.reason || 'Request failed',
+        [
+          'https://open-meteo.com/en/docs',
+          'https://github.com/open-meteo/open-meteo/issues'
+        ]
+      );
+    }
+
+    // Network errors
+    if (error.code === 'ECONNABORTED') {
+      throw new ServiceUnavailableError('OpenMeteo', error);
+    }
+
+    if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
+      throw new ServiceUnavailableError('OpenMeteo', error);
+    }
+
+    // Generic error
+    throw new ApiError(
+      `Open-Meteo API request failed: ${error.message}`,
+      500,
+      'OpenMeteo',
+      `Request failed: ${error.message}`,
+      [
+        'https://github.com/open-meteo/open-meteo/issues',
+        'https://open-meteo.com/en/docs'
+      ],
+      true
+    );
+  }
+
+  /**
+   * Make request with retry logic
+   */
+  private async makeRequest<T>(
+    url: string,
+    params: Record<string, string | number>,
+    retries = 0
+  ): Promise<T> {
+    try {
+      const response = await this.client.get<T>(url, { params });
+      return response.data;
+    } catch (error) {
+      // Retry on rate limit or server errors
+      if (retries < this.maxRetries) {
+        const shouldRetry =
+          (error as Error).message.includes('rate limit') ||
+          (error as Error).message.includes('server error') ||
+          (error as Error).message.includes('timed out');
+
+        if (shouldRetry) {
+          // Exponential backoff with jitter to prevent thundering herd
+          const baseDelay = Math.pow(2, retries) * 1000;
+          const delay = baseDelay * (0.5 + Math.random() * 0.5);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return this.makeRequest<T>(url, params, retries + 1);
+        }
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Get cache statistics
+   */
+  getCacheStats() {
+    return this.cache.getStats();
+  }
+
+  /**
+   * Clear the cache
+   */
+  clearCache(): void {
+    this.cache.clear();
+  }
+
+  /**
+   * Check if the Open-Meteo API is operational
+   * Performs a lightweight health check by requesting a simple query
+   * @returns Object with status information
+   */
+  async checkServiceStatus(): Promise<{
+    operational: boolean;
+    message: string;
+    statusPage: string;
+    timestamp: string;
+  }> {
+    try {
+      // Use a simple request for a recent date at a known location (London, UK)
+      // Using a 1-day range from 30 days ago to avoid the 5-day delay issue
+      const testDate = new Date();
+      testDate.setDate(testDate.getDate() - 30);
+      const dateStr = testDate.toISOString().split('T')[0];
+
+      const response = await this.client.get('/archive', {
+        params: {
+          latitude: 51.5074,
+          longitude: -0.1278,
+          start_date: dateStr,
+          end_date: dateStr,
+          daily: 'temperature_2m_max',
+          timezone: 'UTC'
+        },
+        timeout: 10000 // Shorter timeout for health check
+      });
+
+      if (response.status === 200 && response.data) {
+        return {
+          operational: true,
+          message: 'Open-Meteo API is operational',
+          statusPage: 'https://open-meteo.com/en/docs/model-updates',
+          timestamp: new Date().toISOString()
+        };
+      }
+
+      return {
+        operational: false,
+        message: `Open-Meteo API returned unexpected status: ${response.status}`,
+        statusPage: 'https://open-meteo.com/en/docs/model-updates',
+        timestamp: new Date().toISOString()
+      };
+    } catch (error) {
+      const axiosError = error as AxiosError;
+      let message = 'Open-Meteo API may be experiencing issues';
+      let operational = false;
+
+      if (axiosError.response) {
+        const status = axiosError.response.status;
+        if (status === 429) {
+          operational = true; // API is up, just rate limited
+          message = 'Open-Meteo API is operational but rate limited';
+        } else if (status >= 500) {
+          message = 'Open-Meteo API is experiencing server errors (possible outage)';
+        } else if (status === 400) {
+          operational = true; // Bad request might indicate API is up but our test is wrong
+          message = 'Open-Meteo API is responding (health check may need adjustment)';
+        }
+      } else if (axiosError.code === 'ECONNABORTED') {
+        message = 'Open-Meteo API is not responding (timeout)';
+      } else if (axiosError.code === 'ENOTFOUND' || axiosError.code === 'ECONNREFUSED') {
+        message = 'Cannot connect to Open-Meteo API (DNS or connection failure)';
+      }
+
+      return {
+        operational,
+        message,
+        statusPage: 'https://open-meteo.com/en/docs/model-updates',
+        timestamp: new Date().toISOString()
+      };
+    }
+  }
+
+  /**
+   * Get historical weather data for a location
+   *
+   * @param latitude - Latitude coordinate (-90 to 90)
+   * @param longitude - Longitude coordinate (-180 to 180)
+   * @param startDate - Start date in ISO format (YYYY-MM-DD)
+   * @param endDate - End date in ISO format (YYYY-MM-DD)
+   * @param useHourly - Whether to request hourly data (default: true)
+   * @returns Historical weather data
+   */
+  async getHistoricalWeather(
+    latitude: number,
+    longitude: number,
+    startDate: string,
+    endDate: string,
+    useHourly: boolean = true,
+    prefs: UnitPreferences = IMPERIAL_PREFERENCES
+  ): Promise<OpenMeteoHistoricalResponse> {
+    // Validate coordinates (checks for NaN, Infinity, and range)
+    validateLatitude(latitude);
+    validateLongitude(longitude);
+
+    // Build parameters once
+    const params = this.buildHistoricalParams(latitude, longitude, startDate, endDate, useHourly, prefs);
+
+    // Check cache first (if enabled; unit signature keeps imperial/metric distinct)
+    if (CacheConfig.enabled) {
+      const cacheKey = Cache.generateKey('openmeteo-historical', latitude, longitude, startDate, endDate, useHourly, unitSignature(prefs));
+      const cached = this.cache.get(cacheKey);
+      if (cached) {
+        return cached as OpenMeteoHistoricalResponse;
+      }
+
+      const response = await this.makeRequest<OpenMeteoHistoricalResponse>('/archive', params);
+      this.validateResponse(response, startDate, endDate, useHourly);
+
+      // Use smart TTL based on date range
+      const ttl = getHistoricalDataTTL(startDate);
+      this.cache.set(cacheKey, response, ttl);
+
+      return response;
+    }
+
+    // No caching
+    const response = await this.makeRequest<OpenMeteoHistoricalResponse>('/archive', params);
+    this.validateResponse(response, startDate, endDate, useHourly);
+    return response;
+  }
+
+  /**
+   * Build request parameters for historical weather data
+   * @private
+   */
+  private buildHistoricalParams(
+    latitude: number,
+    longitude: number,
+    startDate: string,
+    endDate: string,
+    useHourly: boolean,
+    prefs: UnitPreferences = IMPERIAL_PREFERENCES
+  ): Record<string, string | number> {
+    const params: Record<string, string | number> = {
+      latitude,
+      longitude,
+      start_date: startDate,
+      end_date: endDate,
+      ...openMeteoUnitParams(prefs),
+      timezone: 'auto'
+    };
+
+    // Request appropriate data granularity
+    if (useHourly) {
+      // Hourly data for detailed observations
+      params.hourly = [
+        'temperature_2m',
+        'relative_humidity_2m',
+        'dewpoint_2m',
+        'apparent_temperature',
+        'precipitation',
+        'rain',
+        'snowfall',
+        'weather_code',
+        'pressure_msl',
+        'cloud_cover',
+        'wind_speed_10m',
+        'wind_direction_10m',
+        'wind_gusts_10m'
+      ].join(',');
+    } else {
+      // Daily summaries for longer time periods
+      params.daily = [
+        'temperature_2m_max',
+        'temperature_2m_min',
+        'temperature_2m_mean',
+        'apparent_temperature_max',
+        'apparent_temperature_min',
+        'precipitation_sum',
+        'rain_sum',
+        'snowfall_sum',
+        'precipitation_hours',
+        'weather_code',
+        'wind_speed_10m_max',
+        'wind_gusts_10m_max',
+        'wind_direction_10m_dominant'
+      ].join(',');
+    }
+
+    return params;
+  }
+
+  /**
+   * Validate that the response contains the expected data
+   * @private
+   */
+  private validateResponse(
+    response: OpenMeteoHistoricalResponse,
+    startDate: string,
+    endDate: string,
+    useHourly: boolean
+  ): void {
+    if (useHourly && (!response.hourly || !response.hourly.time || response.hourly.time.length === 0)) {
+      throw new Error(
+        `No historical weather data available for the specified date range (${startDate} to ${endDate}).\n\n` +
+        'This may occur because:\n' +
+        '- The dates are too recent (data has a 5-day delay for most models)\n' +
+        '- The dates are before 1940 (earliest available data)\n\n' +
+        'Please try adjusting your date range.'
+      );
+    }
+
+    if (!useHourly && (!response.daily || !response.daily.time || response.daily.time.length === 0)) {
+      throw new Error(
+        `No historical weather data available for the specified date range (${startDate} to ${endDate}).\n\n` +
+        'Please try adjusting your date range.'
+      );
+    }
+  }
+
+  /**
+   * Get weather description from WMO weather code
+   * WMO Weather interpretation codes (WW): https://open-meteo.com/en/docs
+   */
+  getWeatherDescription(code: number): string {
+    const weatherCodes: { [key: number]: string } = {
+      0: 'Clear sky',
+      1: 'Mainly clear',
+      2: 'Partly cloudy',
+      3: 'Overcast',
+      45: 'Foggy',
+      48: 'Depositing rime fog',
+      51: 'Light drizzle',
+      53: 'Moderate drizzle',
+      55: 'Dense drizzle',
+      56: 'Light freezing drizzle',
+      57: 'Dense freezing drizzle',
+      61: 'Slight rain',
+      63: 'Moderate rain',
+      65: 'Heavy rain',
+      66: 'Light freezing rain',
+      67: 'Heavy freezing rain',
+      71: 'Slight snow',
+      73: 'Moderate snow',
+      75: 'Heavy snow',
+      77: 'Snow grains',
+      80: 'Slight rain showers',
+      81: 'Moderate rain showers',
+      82: 'Violent rain showers',
+      85: 'Slight snow showers',
+      86: 'Heavy snow showers',
+      95: 'Thunderstorm',
+      96: 'Thunderstorm with slight hail',
+      99: 'Thunderstorm with heavy hail'
+    };
+
+    return weatherCodes[code] || `Unknown (code: ${code})`;
+  }
+
+  /**
+   * Search for locations by name using the Open-Meteo Geocoding API
+   *
+   * @param query - Location name to search for (e.g., "Paris", "New York, NY", "Tokyo")
+   * @param limit - Maximum number of results to return (default: 5, max: 100)
+   * @param language - Language for results (default: 'en')
+   * @returns Geocoding results with coordinates and metadata
+   */
+  async searchLocation(
+    query: string,
+    limit: number = 5,
+    language: string = 'en'
+  ): Promise<GeocodingResponse> {
+    if (!query || query.trim().length === 0) {
+      throw new InvalidLocationError(
+        'OpenMeteo',
+        'Search query cannot be empty'
+      );
+    }
+
+    if (query.trim().length === 1) {
+      throw new InvalidLocationError(
+        'OpenMeteo',
+        'Search query must be at least 2 characters long'
+      );
+    }
+
+    // Validate limit
+    if (limit < 1 || limit > 100) {
+      throw new InvalidLocationError(
+        'OpenMeteo',
+        'Limit must be between 1 and 100'
+      );
+    }
+
+    // Check cache first (locations don't move, so cache indefinitely)
+    if (CacheConfig.enabled) {
+      const cacheKey = Cache.generateKey('openmeteo-geocoding', query, limit, language);
+      const cached = this.cache.get(cacheKey);
+      if (cached) {
+        return cached as GeocodingResponse;
+      }
+
+      const params = {
+        name: query.trim(),
+        count: limit,
+        language,
+        format: 'json'
+      };
+
+      const response = await this.geocodingClient.get<GeocodingResponse>('/search', { params });
+
+      // Cache indefinitely (locations don't change)
+      // Using 30 days as TTL to keep cache from growing unbounded
+      this.cache.set(cacheKey, response.data, 30 * 24 * 60 * 60 * 1000);
+
+      return response.data;
+    }
+
+    // No caching
+    const params = {
+      name: query.trim(),
+      count: limit,
+      language,
+      format: 'json'
+    };
+
+    const response = await this.geocodingClient.get<GeocodingResponse>('/search', { params });
+    return response.data;
+  }
+
+  /**
+   * Get weather forecast from Open-Meteo Forecast API
+   *
+   * @param latitude - Latitude coordinate (-90 to 90)
+   * @param longitude - Longitude coordinate (-180 to 180)
+   * @param days - Number of forecast days (1-16, default: 7)
+   * @param hourly - Whether to include hourly data (default: false)
+   * @returns Weather forecast data
+   */
+  async getForecast(
+    latitude: number,
+    longitude: number,
+    days: number = 7,
+    hourly: boolean = false,
+    prefs: UnitPreferences = IMPERIAL_PREFERENCES
+  ): Promise<OpenMeteoForecastResponse> {
+    // Validate coordinates
+    validateLatitude(latitude);
+    validateLongitude(longitude);
+
+    // Validate days
+    if (days < 1 || days > 16) {
+      throw new InvalidLocationError(
+        'OpenMeteo',
+        'Forecast days must be between 1 and 16'
+      );
+    }
+
+    // Build parameters
+    const params = this.buildForecastParams(latitude, longitude, days, hourly, prefs);
+
+    // Check cache first (unit signature keeps imperial/metric responses distinct)
+    if (CacheConfig.enabled) {
+      const cacheKey = Cache.generateKey('openmeteo-forecast', latitude, longitude, days, hourly, unitSignature(prefs));
+      const cached = this.cache.get(cacheKey);
+      if (cached) {
+        return cached as OpenMeteoForecastResponse;
+      }
+
+      const response = await this.makeRequestToForecast<OpenMeteoForecastResponse>('/forecast', params);
+      this.validateForecastResponse(response, hourly);
+
+      // Cache for 2 hours (forecasts update regularly)
+      this.cache.set(cacheKey, response, 2 * 60 * 60 * 1000);
+
+      return response;
+    }
+
+    // No caching
+    const response = await this.makeRequestToForecast<OpenMeteoForecastResponse>('/forecast', params);
+    this.validateForecastResponse(response, hourly);
+    return response;
+  }
+
+  /**
+   * Get current weather conditions from Open-Meteo Forecast API
+   *
+   * @param latitude - Latitude coordinate (-90 to 90)
+   * @param longitude - Longitude coordinate (-180 to 180)
+   * @param prefs - Unit preferences (default: imperial)
+   * @param includeFireWeather - When true, also request soil moisture and vapour-pressure
+   *   deficit (used to compute the Fosberg Fire Weather Index). Defaults to false so every
+   *   existing caller's request URL is unchanged. If the request 400s with these variables
+   *   attached, the fire variables are treated as best-effort garnish: the request is
+   *   retried once without them (see `fetchCurrentConditions`) rather than failing the
+   *   whole call.
+   * @returns Forecast response populated with current conditions
+   */
+  async getCurrentConditions(
+    latitude: number,
+    longitude: number,
+    prefs: UnitPreferences = IMPERIAL_PREFERENCES,
+    includeFireWeather = false
+  ): Promise<OpenMeteoForecastResponse> {
+    // Validate coordinates
+    validateLatitude(latitude);
+    validateLongitude(longitude);
+
+    // Build parameters
+    const params = this.buildCurrentParams(latitude, longitude, prefs, includeFireWeather);
+
+    // Check cache first (unit signature keeps imperial/metric responses distinct; the
+    // fire-weather flag keeps requests with the extra variables from serving/being served
+    // by a cache entry that lacks them)
+    if (CacheConfig.enabled) {
+      const cacheKey = Cache.generateKey(
+        'openmeteo-current',
+        latitude,
+        longitude,
+        unitSignature(prefs),
+        includeFireWeather
+      );
+      const cached = this.cache.get(cacheKey);
+      if (cached) {
+        return cached as OpenMeteoForecastResponse;
+      }
+
+      const response = await this.fetchCurrentConditions(
+        latitude,
+        longitude,
+        prefs,
+        includeFireWeather,
+        params
+      );
+
+      // Cache for 15 minutes (current conditions update every 20-60 minutes). If the fire
+      // variables were rejected and a garnish-free retry succeeded, the degraded response is
+      // cached under this same (includeFireWeather = true) key — a re-request with the flag
+      // would 400 on the same variables again.
+      this.cache.set(cacheKey, response, CacheConfig.ttl.currentConditions);
+
+      return response;
+    }
+
+    // No caching
+    return this.fetchCurrentConditions(latitude, longitude, prefs, includeFireWeather, params);
+  }
+
+  /**
+   * Issue the current-conditions request, retrying once without the fire-weather variables
+   * if `includeFireWeather` is set and Open-Meteo rejects the request with a 400
+   * (`InvalidLocationError`). Fire weather is best-effort garnish (matching the ACIS/NIFC
+   * precedent elsewhere in this codebase) — it must never take down the whole call.
+   *
+   * Only a 400 (`InvalidLocationError`) triggers the retry. Any other error class (rate
+   * limit, 5xx, etc.) propagates immediately, since the fire variables were not the cause.
+   * If the retry itself also fails, that error propagates — the original 400 was not the
+   * garnish's fault, so no further fallback is attempted.
+   *
+   * @private
+   */
+  private async fetchCurrentConditions(
+    latitude: number,
+    longitude: number,
+    prefs: UnitPreferences,
+    includeFireWeather: boolean,
+    params: Record<string, string | number>
+  ): Promise<OpenMeteoForecastResponse> {
+    try {
+      const response = await this.makeRequestToForecast<OpenMeteoForecastResponse>('/forecast', params);
+      this.validateCurrentResponse(response);
+      return response;
+    } catch (error) {
+      if (!includeFireWeather || !(error instanceof InvalidLocationError)) {
+        throw error;
+      }
+
+      logger.warn('Fire-weather variables rejected by Open-Meteo; retrying current conditions without them', {
+        service: 'OpenMeteo',
+        reason: error.message
+      });
+
+      const fallbackParams = this.buildCurrentParams(latitude, longitude, prefs, false);
+      const retryResponse = await this.makeRequestToForecast<OpenMeteoForecastResponse>(
+        '/forecast',
+        fallbackParams
+      );
+      this.validateCurrentResponse(retryResponse);
+      return retryResponse;
+    }
+  }
+
+  /**
+   * Build request parameters for current conditions data
+   *
+   * @param includeFireWeather - When true, appends soil moisture and vapour-pressure
+   *   deficit to the `current` variable list. These two variables are always returned
+   *   in fixed units (m³/m³ and kPa) — they are not affected by `openMeteoUnitParams`.
+   * @private
+   */
+  private buildCurrentParams(
+    latitude: number,
+    longitude: number,
+    prefs: UnitPreferences = IMPERIAL_PREFERENCES,
+    includeFireWeather = false
+  ): Record<string, string | number> {
+    const params: Record<string, string | number> = {
+      latitude,
+      longitude,
+      forecast_days: 1,
+      ...openMeteoUnitParams(prefs),
+      timezone: 'auto'
+    };
+
+    const currentVariables = [
+      'temperature_2m',
+      'relative_humidity_2m',
+      'apparent_temperature',
+      'dew_point_2m',
+      'is_day',
+      'precipitation',
+      'rain',
+      'showers',
+      'snowfall',
+      'weather_code',
+      'cloud_cover',
+      'pressure_msl',
+      'wind_speed_10m',
+      'wind_direction_10m',
+      'wind_gusts_10m'
+    ];
+
+    if (includeFireWeather) {
+      currentVariables.push('soil_moisture_0_to_1cm', 'vapour_pressure_deficit');
+    }
+
+    params.current = currentVariables.join(',');
+
+    params.daily = 'temperature_2m_max,temperature_2m_min';
+
+    return params;
+  }
+
+  /**
+   * Validate that the current conditions response contains the expected data
+   * @private
+   */
+  private validateCurrentResponse(response: OpenMeteoForecastResponse): void {
+    if (!response.current) {
+      throw new DataNotFoundError(
+        'OpenMeteo',
+        'No current conditions data available for the specified location'
+      );
+    }
+
+    if (!response.current_units) {
+      throw new DataNotFoundError(
+        'OpenMeteo',
+        'No current conditions data available for the specified location'
+      );
+    }
+  }
+
+  /**
+   * Build request parameters for forecast data
+   * @private
+   */
+  private buildForecastParams(
+    latitude: number,
+    longitude: number,
+    days: number,
+    hourly: boolean,
+    prefs: UnitPreferences = IMPERIAL_PREFERENCES
+  ): Record<string, string | number> {
+    const params: Record<string, string | number> = {
+      latitude,
+      longitude,
+      forecast_days: days,
+      ...openMeteoUnitParams(prefs),
+      timezone: 'auto'
+    };
+
+    // Always include daily data with sunrise/sunset
+    params.daily = [
+      'weather_code',
+      'temperature_2m_max',
+      'temperature_2m_min',
+      'apparent_temperature_max',
+      'apparent_temperature_min',
+      'sunrise',
+      'sunset',
+      'daylight_duration',
+      'sunshine_duration',
+      'uv_index_max',
+      'precipitation_sum',
+      'rain_sum',
+      'showers_sum',
+      'snowfall_sum',
+      'precipitation_hours',
+      'precipitation_probability_max',
+      'wind_speed_10m_max',
+      'wind_gusts_10m_max',
+      'wind_direction_10m_dominant'
+    ].join(',');
+
+    // Optionally include hourly data
+    if (hourly) {
+      params.hourly = [
+        'temperature_2m',
+        'relative_humidity_2m',
+        'dewpoint_2m',
+        'apparent_temperature',
+        'precipitation_probability',
+        'precipitation',
+        'rain',
+        'showers',
+        'snowfall',
+        'snow_depth',
+        'weather_code',
+        'pressure_msl',
+        'cloud_cover',
+        'visibility',
+        'wind_speed_10m',
+        'wind_direction_10m',
+        'wind_gusts_10m',
+        'uv_index',
+        'is_day'
+      ].join(',');
+    }
+
+    return params;
+  }
+
+  /**
+   * Make request to forecast API with retry logic
+   * @private
+   */
+  private async makeRequestToForecast<T>(
+    url: string,
+    params: Record<string, string | number>,
+    retries = 0
+  ): Promise<T> {
+    try {
+      const response = await this.forecastClient.get<T>(url, { params });
+      return response.data;
+    } catch (error) {
+      // Retry on rate limit or server errors
+      if (retries < this.maxRetries) {
+        const shouldRetry =
+          (error as Error).message.includes('rate limit') ||
+          (error as Error).message.includes('server error') ||
+          (error as Error).message.includes('timed out');
+
+        if (shouldRetry) {
+          const baseDelay = Math.pow(2, retries) * 1000;
+          const delay = baseDelay * (0.5 + Math.random() * 0.5);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return this.makeRequestToForecast<T>(url, params, retries + 1);
+        }
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Validate that the forecast response contains the expected data
+   * @private
+   */
+  private validateForecastResponse(
+    response: OpenMeteoForecastResponse,
+    hourly: boolean
+  ): void {
+    if (hourly && (!response.hourly || !response.hourly.time || response.hourly.time.length === 0)) {
+      throw new DataNotFoundError(
+        'OpenMeteo',
+        'No hourly forecast data available for the specified location'
+      );
+    }
+
+    if (!response.daily || !response.daily.time || response.daily.time.length === 0) {
+      throw new DataNotFoundError(
+        'OpenMeteo',
+        'No daily forecast data available for the specified location'
+      );
+    }
+  }
+
+  /**
+   * Get a multi-model forecast comparison from the Open-Meteo Forecast API
+   * (`get_forecast`'s `compare_models` flag, `docs/multi-model-comparison-plan.md`
+   * D3).
+   *
+   * A distinct method from `getForecast` — not an option on it — because the
+   * `models=` parameter changes the shape of every `daily` key (suffixed per
+   * model) rather than adding new keys, and the comparison IS the requested
+   * product (D7): unlike the fire-weather flag on `getCurrentConditions`,
+   * there is no garnish-retry-without-the-extra-params fallback here. A
+   * failed request propagates sanitized via `makeRequestToForecast`'s
+   * existing error mapping.
+   *
+   * @param latitude - Latitude coordinate (-90 to 90)
+   * @param longitude - Longitude coordinate (-180 to 180)
+   * @param days - Number of forecast days (1-16, default: 7)
+   * @param prefs - Unit preferences (default: imperial)
+   * @returns Multi-model daily comparison data, suffixed per model
+   */
+  async getModelComparison(
+    latitude: number,
+    longitude: number,
+    days: number = 7,
+    prefs: UnitPreferences = IMPERIAL_PREFERENCES
+  ): Promise<OpenMeteoModelComparisonResponse> {
+    // Validate coordinates
+    validateLatitude(latitude);
+    validateLongitude(longitude);
+
+    // Validate days (same 1-16 range as getForecast)
+    if (days < 1 || days > 16) {
+      throw new InvalidLocationError(
+        'OpenMeteo',
+        'Forecast days must be between 1 and 16'
+      );
+    }
+
+    // Build parameters
+    const params = this.buildModelComparisonParams(latitude, longitude, days, prefs);
+
+    // Check cache first (unit signature keeps imperial/metric responses distinct).
+    // Namespace is 'openmeteo-model-comparison' — distinct from 'openmeteo-forecast'
+    // so a comparison response can never serve or be served by a plain-forecast
+    // cache entry. The model set (COMPARISON_MODELS) is a fixed constant, so it is
+    // deliberately NOT a key component; the cache is in-process, so any future
+    // change to the set ships with a restart that clears it.
+    if (CacheConfig.enabled) {
+      const cacheKey = Cache.generateKey('openmeteo-model-comparison', latitude, longitude, days, unitSignature(prefs));
+      const cached = this.cache.get(cacheKey);
+      if (cached) {
+        return cached as OpenMeteoModelComparisonResponse;
+      }
+
+      const response = await this.makeRequestToForecast<OpenMeteoModelComparisonResponse>('/forecast', params);
+      this.validateModelComparisonResponse(response);
+
+      // TTL from config (not the getForecast's hardcoded 2h literal) — see D8;
+      // getForecast's own hardcoded TTL is intentionally left untouched.
+      this.cache.set(cacheKey, response, CacheConfig.ttl.forecast);
+
+      return response;
+    }
+
+    // No caching
+    const response = await this.makeRequestToForecast<OpenMeteoModelComparisonResponse>('/forecast', params);
+    this.validateModelComparisonResponse(response);
+    return response;
+  }
+
+  /**
+   * Build request parameters for a multi-model comparison request.
+   *
+   * Deliberately NOT built on top of `buildForecastParams` — that method's
+   * 19-variable daily list, multiplied across `COMPARISON_MODELS.length`
+   * models, would sextuple response size for variables the comparison view
+   * never renders (D3). Requests exactly the six verified daily variables in
+   * a fixed order, plus `models=<COMPARISON_MODELS joined>`.
+   * @private
+   */
+  private buildModelComparisonParams(
+    latitude: number,
+    longitude: number,
+    days: number,
+    prefs: UnitPreferences = IMPERIAL_PREFERENCES
+  ): Record<string, string | number> {
+    return {
+      latitude,
+      longitude,
+      forecast_days: days,
+      ...openMeteoUnitParams(prefs),
+      timezone: 'auto',
+      daily: [
+        'weather_code',
+        'temperature_2m_max',
+        'temperature_2m_min',
+        'precipitation_sum',
+        'precipitation_probability_max',
+        'wind_speed_10m_max'
+      ].join(','),
+      models: COMPARISON_MODELS.join(',')
+    };
+  }
+
+  /**
+   * Validate that a multi-model comparison response contains usable data.
+   *
+   * Cannot reuse `validateForecastResponse`: with `models=` set to more than
+   * one model, `daily.time` is present but the *unsuffixed* keys that
+   * validator checks (e.g. plain `temperature_2m_max`) are absent — every key
+   * is suffixed per model instead. This validator instead requires
+   * non-empty `daily.time` AND at least one `temperature_2m_max_<model>` key
+   * present for a model in `COMPARISON_MODELS`.
+   *
+   * Defensive note (live-verified, design header fact (a)): a request naming
+   * exactly ONE model returns UNSUFFIXED keys — our curated list always
+   * requests six models, so that shape should never occur here, but this
+   * validator fails loudly with `DataNotFoundError` rather than silently
+   * mis-parsing if it ever does.
+   * @private
+   */
+  private validateModelComparisonResponse(response: OpenMeteoModelComparisonResponse): void {
+    if (!response.daily || !response.daily.time || response.daily.time.length === 0) {
+      throw new DataNotFoundError(
+        'OpenMeteo',
+        'No model comparison data available for the specified location'
+      );
+    }
+
+    const hasSuffixedTemperatureKey = COMPARISON_MODELS.some(
+      model => Array.isArray(response.daily[`temperature_2m_max_${model}`])
+    );
+    if (!hasSuffixedTemperatureKey) {
+      throw new DataNotFoundError(
+        'OpenMeteo',
+        'No model comparison data available for the specified location'
+      );
+    }
+  }
+
+  /**
+   * Make request to the ensemble API with retry logic. Follows
+   * `makeRequestToFlood`'s shape exactly — retry/backoff/sanitization are
+   * shared via `handleError`, wired identically for every host client.
+   * @private
+   */
+  private async makeRequestToEnsemble<T>(
+    url: string,
+    params: Record<string, string | number>,
+    retries = 0
+  ): Promise<T> {
+    try {
+      const response = await this.ensembleClient.get<T>(url, { params });
+      return response.data;
+    } catch (error) {
+      // Retry on rate limit or server errors
+      if (retries < this.maxRetries) {
+        const shouldRetry =
+          (error as Error).message.includes('rate limit') ||
+          (error as Error).message.includes('server error') ||
+          (error as Error).message.includes('timed out');
+
+        if (shouldRetry) {
+          const baseDelay = Math.pow(2, retries) * 1000;
+          const delay = baseDelay * (0.5 + Math.random() * 0.5);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return this.makeRequestToEnsemble<T>(url, params, retries + 1);
+        }
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Get a single-model ensemble spread from the Open-Meteo Ensemble API
+   * (`get_forecast`'s `ensemble_spread` flag, `docs/ensemble-spread-plan.md`
+   * D3). One fixed model (`ENSEMBLE_MODEL`, imported from the pure
+   * `ensembleSpread` util — the service imports the constant from the util,
+   * never the reverse, mirroring the corrected `compare_models` arrangement).
+   *
+   * This is **contract, not garnish** (D7): a failed request propagates
+   * sanitized via `makeRequestToEnsemble`'s shared error mapping — there is
+   * no retry-without-models and no degraded fallback to a plain forecast.
+   *
+   * @param latitude - Latitude coordinate (-90 to 90)
+   * @param longitude - Longitude coordinate (-180 to 180)
+   * @param days - Number of forecast days (1-16, default: 7)
+   * @param prefs - Unit preferences (default: imperial)
+   * @returns Single-model ensemble daily data: one unsuffixed control-run
+   *   series plus `_memberNN` perturbed-member series per variable
+   */
+  async getEnsembleSpread(
+    latitude: number,
+    longitude: number,
+    days: number = 7,
+    prefs: UnitPreferences = IMPERIAL_PREFERENCES
+  ): Promise<OpenMeteoEnsembleResponse> {
+    // Validate coordinates
+    validateLatitude(latitude);
+    validateLongitude(longitude);
+
+    // Validate days (same 1-16 range as getForecast / getModelComparison)
+    if (days < 1 || days > 16) {
+      throw new InvalidLocationError(
+        'OpenMeteo',
+        'Forecast days must be between 1 and 16'
+      );
+    }
+
+    // Build parameters
+    const params = this.buildEnsembleParams(latitude, longitude, days, prefs);
+
+    // Check cache first (unit signature keeps imperial/metric responses distinct).
+    // Namespace is 'openmeteo-ensemble' — distinct from 'openmeteo-forecast' and
+    // 'openmeteo-model-comparison' so an ensemble response can never serve or be
+    // served by either. ENSEMBLE_MODEL is a fixed constant, so it is deliberately
+    // NOT a key component (D8); the cache is in-process, so any future change to
+    // the model ships with a restart that clears it.
+    if (CacheConfig.enabled) {
+      const cacheKey = Cache.generateKey('openmeteo-ensemble', latitude, longitude, days, unitSignature(prefs));
+      const cached = this.cache.get(cacheKey);
+      if (cached) {
+        return cached as OpenMeteoEnsembleResponse;
+      }
+
+      const response = await this.makeRequestToEnsemble<OpenMeteoEnsembleResponse>('/ensemble', params);
+      this.validateEnsembleResponse(response);
+
+      // TTL from config, matching getModelComparison's D8 pattern.
+      this.cache.set(cacheKey, response, CacheConfig.ttl.forecast);
+
+      return response;
+    }
+
+    // No caching
+    const response = await this.makeRequestToEnsemble<OpenMeteoEnsembleResponse>('/ensemble', params);
+    this.validateEnsembleResponse(response);
+    return response;
+  }
+
+  /**
+   * Build request parameters for a single-model ensemble request.
+   *
+   * Exactly five daily variables, in a fixed order — **never**
+   * `precipitation_probability_max`: verified live on the ensemble endpoint
+   * (design "Upstream verification" c) to return HTTP 200 with unit
+   * `"undefined"` and all-null control *and* member arrays, because
+   * probability is *derived from* ensembles rather than published by them —
+   * the wet-member fraction the pure module computes from `precipitation_sum`
+   * IS the probability product, so requesting the field would only add a
+   * useless all-null series to every response.
+   * @private
+   */
+  private buildEnsembleParams(
+    latitude: number,
+    longitude: number,
+    days: number,
+    prefs: UnitPreferences = IMPERIAL_PREFERENCES
+  ): Record<string, string | number> {
+    return {
+      latitude,
+      longitude,
+      daily: [
+        'weather_code',
+        'temperature_2m_max',
+        'temperature_2m_min',
+        'precipitation_sum',
+        'wind_speed_10m_max'
+      ].join(','),
+      models: ENSEMBLE_MODEL,
+      forecast_days: days,
+      timezone: 'auto',
+      ...openMeteoUnitParams(prefs)
+    };
+  }
+
+  /**
+   * Validate that a single-model ensemble response contains usable member
+   * data.
+   *
+   * Requires non-empty `daily.time` AND a `temperature_2m_max_member01` key.
+   * Fails loudly with `DataNotFoundError` rather than mis-parsing on two
+   * shapes it must never silently accept (design "Upstream verification" h):
+   *
+   * 1. A **memberless plain-forecast shape** — only unsuffixed keys, no
+   *    `_memberNN` series (e.g. if the ensemble host ever served a plain
+   *    forecast response for some request).
+   * 2. The **multi-model renamed-suffix shape** — with more than one model
+   *    requested, Open-Meteo suffixes member keys with *resolved internal
+   *    names* rather than the requested alias (e.g.
+   *    `temperature_2m_max_member01_ncep_gefs_seamless` instead of plain
+   *    `temperature_2m_max_member01`). This feature requests exactly one
+   *    model (`ENSEMBLE_MODEL`), so this shape is unreachable via our fixed
+   *    constant — guarded anyway, since a validator that mis-parses instead
+   *    of failing loudly is worse than one that's merely defensive.
+   * @private
+   */
+  private validateEnsembleResponse(response: OpenMeteoEnsembleResponse): void {
+    if (!response.daily || !response.daily.time || response.daily.time.length === 0) {
+      throw new DataNotFoundError(
+        'OpenMeteo',
+        'No ensemble spread data available for the specified location'
+      );
+    }
+
+    if (!Array.isArray(response.daily.temperature_2m_max_member01)) {
+      throw new DataNotFoundError(
+        'OpenMeteo',
+        'No ensemble spread data available for the specified location'
+      );
+    }
+  }
+
+  /**
+   * Get air quality data from Open-Meteo Air Quality API
+   *
+   * @param latitude - Latitude coordinate (-90 to 90)
+   * @param longitude - Longitude coordinate (-180 to 180)
+   * @param forecast - Whether to include hourly forecast (default: false, returns current only)
+   * @param forecastDays - Number of forecast days (1-7, default: 5)
+   * @returns Air quality data including AQI, pollutants, and UV index
+   */
+  async getAirQuality(
+    latitude: number,
+    longitude: number,
+    forecast: boolean = false,
+    forecastDays: number = 5
+  ): Promise<OpenMeteoAirQualityResponse> {
+    // Validate coordinates
+    validateLatitude(latitude);
+    validateLongitude(longitude);
+
+    // Validate forecast days
+    if (forecastDays < 1 || forecastDays > 7) {
+      throw new InvalidLocationError(
+        'OpenMeteo',
+        'Air quality forecast days must be between 1 and 7'
+      );
+    }
+
+    // Build parameters
+    const params = this.buildAirQualityParams(latitude, longitude, forecast, forecastDays);
+
+    // Check cache first
+    if (CacheConfig.enabled) {
+      const cacheKey = Cache.generateKey('openmeteo-airquality', latitude, longitude, forecast, forecastDays);
+      const cached = this.cache.get(cacheKey);
+      if (cached) {
+        return cached as OpenMeteoAirQualityResponse;
+      }
+
+      const response = await this.makeRequestToAirQuality<OpenMeteoAirQualityResponse>('/air-quality', params);
+      this.validateAirQualityResponse(response, forecast);
+
+      // Cache for 1 hour (air quality updates hourly)
+      this.cache.set(cacheKey, response, 60 * 60 * 1000);
+
+      return response;
+    }
+
+    // No caching
+    const response = await this.makeRequestToAirQuality<OpenMeteoAirQualityResponse>('/air-quality', params);
+    this.validateAirQualityResponse(response, forecast);
+    return response;
+  }
+
+  /**
+   * Build request parameters for air quality data
+   * @private
+   */
+  private buildAirQualityParams(
+    latitude: number,
+    longitude: number,
+    forecast: boolean,
+    forecastDays: number
+  ): Record<string, string | number> {
+    const params: Record<string, string | number> = {
+      latitude,
+      longitude,
+      timezone: 'auto'
+    };
+
+    // Always include current data
+    params.current = [
+      'pm10',
+      'pm2_5',
+      'carbon_monoxide',
+      'nitrogen_dioxide',
+      'sulphur_dioxide',
+      'ozone',
+      'aerosol_optical_depth',
+      'dust',
+      'uv_index',
+      'uv_index_clear_sky',
+      'ammonia',
+      // Pollen (CAMS European model): real values in Europe, all-null elsewhere
+      // (HTTP 200 either way — verified live 2026-08-13). Current block only;
+      // the hourly fetch stays trimmed to the three variables the forecast
+      // formatter reads (v1.13).
+      'alder_pollen',
+      'birch_pollen',
+      'grass_pollen',
+      'mugwort_pollen',
+      'olive_pollen',
+      'ragweed_pollen',
+      'european_aqi',
+      'european_aqi_pm2_5',
+      'european_aqi_pm10',
+      'european_aqi_nitrogen_dioxide',
+      'european_aqi_ozone',
+      'european_aqi_sulphur_dioxide',
+      'us_aqi',
+      'us_aqi_pm2_5',
+      'us_aqi_pm10',
+      'us_aqi_nitrogen_dioxide',
+      'us_aqi_ozone',
+      'us_aqi_sulphur_dioxide',
+      'us_aqi_carbon_monoxide'
+    ].join(',');
+
+    // Optionally include hourly forecast data. The forecast formatter reads only
+    // the two AQI composites and UV; the raw pollutant series were fetched but
+    // never displayed at any detail level, so they are deliberately not requested.
+    if (forecast) {
+      params.forecast_days = forecastDays;
+      params.hourly = [
+        'us_aqi',
+        'european_aqi',
+        'uv_index'
+      ].join(',');
+    }
+
+    return params;
+  }
+
+  /**
+   * Make request to air quality API with retry logic
+   * @private
+   */
+  private async makeRequestToAirQuality<T>(
+    url: string,
+    params: Record<string, string | number>,
+    retries = 0
+  ): Promise<T> {
+    try {
+      const response = await this.airQualityClient.get<T>(url, { params });
+      return response.data;
+    } catch (error) {
+      // Retry on rate limit or server errors
+      if (retries < this.maxRetries) {
+        const shouldRetry =
+          (error as Error).message.includes('rate limit') ||
+          (error as Error).message.includes('server error') ||
+          (error as Error).message.includes('timed out');
+
+        if (shouldRetry) {
+          const baseDelay = Math.pow(2, retries) * 1000;
+          const delay = baseDelay * (0.5 + Math.random() * 0.5);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return this.makeRequestToAirQuality<T>(url, params, retries + 1);
+        }
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Validate that the air quality response contains the expected data
+   * @private
+   */
+  private validateAirQualityResponse(
+    response: OpenMeteoAirQualityResponse,
+    forecast: boolean
+  ): void {
+    if (!response.current || !response.current.time) {
+      throw new DataNotFoundError(
+        'OpenMeteo',
+        'No current air quality data available for the specified location'
+      );
+    }
+
+    if (forecast && (!response.hourly || !response.hourly.time || response.hourly.time.length === 0)) {
+      throw new DataNotFoundError(
+        'OpenMeteo',
+        'No hourly air quality forecast data available for the specified location'
+      );
+    }
+  }
+
+  /**
+   * Get marine conditions data from Open-Meteo Marine API
+   *
+   * @param latitude - Latitude coordinate (-90 to 90)
+   * @param longitude - Longitude coordinate (-180 to 180)
+   * @param forecast - Whether to include daily forecast aggregates (default: false, returns current only)
+   * @param forecastDays - Number of forecast days (1-16, default: 5). The Marine API
+   *   accepts up to 16 days (verified live 2026-07-16), but the underlying model's
+   *   horizon is typically ~10 days — trailing days beyond that are null-padded.
+   * @returns Marine conditions including waves, swell, and currents
+   */
+  async getMarine(
+    latitude: number,
+    longitude: number,
+    forecast: boolean = false,
+    forecastDays: number = 5
+  ): Promise<OpenMeteoMarineResponse> {
+    // Validate coordinates
+    validateLatitude(latitude);
+    validateLongitude(longitude);
+
+    // Validate forecast days
+    if (forecastDays < 1 || forecastDays > 16) {
+      throw new InvalidLocationError(
+        'OpenMeteo',
+        'Marine forecast days must be between 1 and 16'
+      );
+    }
+
+    // Build parameters
+    const params = this.buildMarineParams(latitude, longitude, forecast, forecastDays);
+
+    // Check cache first
+    if (CacheConfig.enabled) {
+      const cacheKey = Cache.generateKey('openmeteo-marine', latitude, longitude, forecast, forecastDays);
+      const cached = this.cache.get(cacheKey);
+      if (cached) {
+        return cached as OpenMeteoMarineResponse;
+      }
+
+      const response = await this.makeRequestToMarine<OpenMeteoMarineResponse>('/marine', params);
+      this.validateMarineResponse(response, forecast);
+
+      // Cache for 1 hour (marine conditions update hourly)
+      this.cache.set(cacheKey, response, 60 * 60 * 1000);
+
+      return response;
+    }
+
+    // No caching
+    const response = await this.makeRequestToMarine<OpenMeteoMarineResponse>('/marine', params);
+    this.validateMarineResponse(response, forecast);
+    return response;
+  }
+
+  /**
+   * Build request parameters for marine data
+   * @private
+   */
+  private buildMarineParams(
+    latitude: number,
+    longitude: number,
+    forecast: boolean,
+    forecastDays: number
+  ): Record<string, string | number> {
+    const params: Record<string, string | number> = {
+      latitude,
+      longitude,
+      timezone: 'auto'
+    };
+
+    // Always include current data
+    params.current = [
+      'wave_height',
+      'wave_direction',
+      'wave_period',
+      'wind_wave_height',
+      'wind_wave_direction',
+      'wind_wave_period',
+      'wind_wave_peak_period',
+      'swell_wave_height',
+      'swell_wave_direction',
+      'swell_wave_period',
+      'swell_wave_peak_period',
+      'ocean_current_velocity',
+      'ocean_current_direction'
+    ].join(',');
+
+    // Optionally include daily forecast aggregates
+    if (forecast) {
+      params.forecast_days = forecastDays;
+      params.daily = [
+        'wave_height_max',
+        'wave_direction_dominant',
+        'wave_period_max',
+        'wind_wave_height_max',
+        'wind_wave_direction_dominant',
+        'wind_wave_period_max',
+        'wind_wave_peak_period_max',
+        'swell_wave_height_max',
+        'swell_wave_direction_dominant',
+        'swell_wave_period_max',
+        'swell_wave_peak_period_max'
+      ].join(',');
+    }
+
+    return params;
+  }
+
+  /**
+   * Make request to marine API with retry logic
+   * @private
+   */
+  private async makeRequestToMarine<T>(
+    url: string,
+    params: Record<string, string | number>,
+    retries = 0
+  ): Promise<T> {
+    try {
+      const response = await this.marineClient.get<T>(url, { params });
+      return response.data;
+    } catch (error) {
+      // Retry on rate limit or server errors
+      if (retries < this.maxRetries) {
+        const shouldRetry =
+          (error as Error).message.includes('rate limit') ||
+          (error as Error).message.includes('server error') ||
+          (error as Error).message.includes('timed out');
+
+        if (shouldRetry) {
+          const baseDelay = Math.pow(2, retries) * 1000;
+          const delay = baseDelay * (0.5 + Math.random() * 0.5);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return this.makeRequestToMarine<T>(url, params, retries + 1);
+        }
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Validate that the marine response contains the expected data
+   * @private
+   */
+  private validateMarineResponse(
+    response: OpenMeteoMarineResponse,
+    forecast: boolean
+  ): void {
+    if (!response.current || !response.current.time) {
+      throw new DataNotFoundError(
+        'OpenMeteo',
+        'No current marine conditions data available for the specified location'
+      );
+    }
+
+    if (forecast && (!response.daily || !response.daily.time || response.daily.time.length === 0)) {
+      throw new DataNotFoundError(
+        'OpenMeteo',
+        'No daily marine forecast data available for the specified location'
+      );
+    }
+  }
+
+  /**
+   * Get river discharge data from the Open-Meteo Flood API (GloFAS v4 model)
+   *
+   * Accepts one or more coordinate pairs in a single request — this is what
+   * lets the channel-snapping probe (a 3x3 grid around a target point) fetch
+   * its whole neighborhood as one HTTP call instead of nine.
+   *
+   * Does NOT validate that any returned series is non-null: a location with
+   * no river running through its grid cell (ocean, desert) legitimately
+   * returns HTTP 200 with null-filled arrays, and that must reach the
+   * caller rather than being treated as an error.
+   *
+   * @param latitudes - Latitude coordinates (-90 to 90), one per point
+   * @param longitudes - Longitude coordinates (-180 to 180), one per point,
+   *   same length and order as `latitudes`
+   * @param forecastDays - Number of forecast days (1-210, default: 7). The
+   *   live API accepts up to 366, but 210 is the documented contract.
+   * @returns One response per requested coordinate, always as an array —
+   *   Open-Meteo returns a bare object for a single-coordinate request and
+   *   an array for a multi-point request, and this normalizes both shapes.
+   */
+  async getRiverDischarge(
+    latitudes: number[],
+    longitudes: number[],
+    forecastDays: number = 7
+  ): Promise<OpenMeteoFloodResponse[]> {
+    if (latitudes.length === 0 || longitudes.length === 0) {
+      throw new InvalidLocationError(
+        'OpenMeteo',
+        'At least one coordinate pair is required for river discharge lookup'
+      );
+    }
+
+    if (latitudes.length !== longitudes.length) {
+      throw new InvalidLocationError(
+        'OpenMeteo',
+        'Latitude and longitude arrays must have the same length'
+      );
+    }
+
+    // Validate every coordinate
+    latitudes.forEach(lat => validateLatitude(lat));
+    longitudes.forEach(lon => validateLongitude(lon));
+
+    // Validate forecast days
+    if (forecastDays < 1 || forecastDays > 210) {
+      throw new InvalidLocationError(
+        'OpenMeteo',
+        'River discharge forecast days must be between 1 and 210'
+      );
+    }
+
+    // Build parameters
+    const params = this.buildFloodParams(latitudes, longitudes, forecastDays);
+
+    // Rounded coordinates for the cache key: 2 decimals stays finer than
+    // the 0.05-degree probe pitch, so distinct probe grids never collide.
+    const roundedCoords = latitudes
+      .map((lat, i) => `${lat.toFixed(2)},${longitudes[i].toFixed(2)}`)
+      .join('|');
+
+    // Check cache first
+    if (CacheConfig.enabled) {
+      const cacheKey = Cache.generateKey('openmeteo-flood', roundedCoords, forecastDays);
+      const cached = this.cache.get(cacheKey);
+      if (cached) {
+        return cached as OpenMeteoFloodResponse[];
+      }
+
+      const response = await this.makeRequestToFlood<OpenMeteoFloodResponse | OpenMeteoFloodResponse[]>('/flood', params);
+      const normalized = Array.isArray(response) ? response : [response];
+
+      this.cache.set(cacheKey, normalized, CacheConfig.ttl.floodDischarge);
+
+      return normalized;
+    }
+
+    // No caching
+    const response = await this.makeRequestToFlood<OpenMeteoFloodResponse | OpenMeteoFloodResponse[]>('/flood', params);
+    return Array.isArray(response) ? response : [response];
+  }
+
+  /**
+   * Build request parameters for river discharge data
+   * @private
+   */
+  private buildFloodParams(
+    latitudes: number[],
+    longitudes: number[],
+    forecastDays: number
+  ): Record<string, string | number> {
+    return {
+      latitude: latitudes.join(','),
+      longitude: longitudes.join(','),
+      daily: [
+        'river_discharge',
+        'river_discharge_mean',
+        'river_discharge_median',
+        'river_discharge_max',
+        'river_discharge_min',
+        'river_discharge_p25',
+        'river_discharge_p75'
+      ].join(','),
+      past_days: 31,
+      forecast_days: forecastDays,
+      timezone: 'auto'
+    };
+  }
+
+  /**
+   * Make request to flood API with retry logic
+   * @private
+   */
+  private async makeRequestToFlood<T>(
+    url: string,
+    params: Record<string, string | number>,
+    retries = 0
+  ): Promise<T> {
+    try {
+      const response = await this.floodClient.get<T>(url, { params });
+      return response.data;
+    } catch (error) {
+      // Retry on rate limit or server errors
+      if (retries < this.maxRetries) {
+        const shouldRetry =
+          (error as Error).message.includes('rate limit') ||
+          (error as Error).message.includes('server error') ||
+          (error as Error).message.includes('timed out');
+
+        if (shouldRetry) {
+          const baseDelay = Math.pow(2, retries) * 1000;
+          const delay = baseDelay * (0.5 + Math.random() * 0.5);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return this.makeRequestToFlood<T>(url, params, retries + 1);
+        }
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Get climate normals (1991-2020 averages) for a specific date
+   *
+   * Backed by a per-location, per-instance **table** (D1): the first call for
+   * a given `(lat2dp, lon2dp)` fetches one full year (1991-01-01…2020-12-31)
+   * of daily archive data and computes all 366 `"MM-DD"` slots in one pass
+   * (`computeNormalsTable`); the table itself — not a per-date result — is
+   * what's cached, under `getNormalsTableCacheKey` with TTL
+   * `CacheConfig.ttl.normals`. Every subsequent call for the same location,
+   * for any date (including the fan-out `get_weather_summary` makes across
+   * forecast + current), indexes into the cached table instead of refetching
+   * — including when the table's slots are all unavailable (open ocean: the
+   * table itself still caches, so a second date at that location makes no
+   * second archive pull).
+   *
+   * @param latitude - Latitude (-90 to 90)
+   * @param longitude - Longitude (-180 to 180)
+   * @param month - Month (1-12)
+   * @param day - Day of month (1-31)
+   * @returns Climate normals (30-year averages) in Fahrenheit and inches
+   * @throws {InvalidLocationError} If coordinates are invalid
+   * @throws {DataNotFoundError} If the requested date's slot has too few
+   *   qualifying samples in the 30-year record (open ocean, sparse archive)
+   * @throws {ServiceUnavailableError} If Open-Meteo API is unavailable
+   */
+  async getClimateNormals(
+    latitude: number,
+    longitude: number,
+    month: number,
+    day: number
+  ): Promise<ClimateNormals> {
+    validateLatitude(latitude);
+    validateLongitude(longitude);
+
+    const table = await this.getNormalsTable(latitude, longitude);
+
+    const slotKey = `${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    const slot = table[slotKey];
+
+    if (!slot) {
+      throw new DataNotFoundError(
+        'OpenMeteo',
+        `No climate normals available for ${month}/${day} at this location (insufficient samples in the 1991-2020 record)`
+      );
+    }
+
+    return {
+      tempHigh: slot.tempHigh,
+      tempLow: slot.tempLow,
+      precipitation: slot.precipitation,
+      source: 'Open-Meteo',
+      month,
+      day
+    };
+  }
+
+  /**
+   * Get the cached full-year normals table for a location, fetching and
+   * computing it on a cache miss. Private — `getClimateNormals` is the
+   * public per-date entry point per D1's kept signature.
+   * @private
+   */
+  private async getNormalsTable(latitude: number, longitude: number): Promise<NormalsTable> {
+    const cacheKey = getNormalsTableCacheKey(latitude, longitude);
+    if (CacheConfig.enabled) {
+      const cached = this.cache.get(cacheKey) as NormalsTable | undefined;
+      if (cached) {
+        const redacted = redactCoordinatesForLogging(latitude, longitude);
+        logger.info('Climate normals table cache hit', { ...redacted });
+        return cached;
+      }
+    }
+
+    // Join a pull already running for this location rather than racing it (D3).
+    const inFlight = this.normalsTableInFlight.get(cacheKey);
+    if (inFlight) {
+      const redacted = redactCoordinatesForLogging(latitude, longitude);
+      logger.info('Joining in-flight climate normals table pull', { ...redacted });
+      return inFlight;
+    }
+
+    // `finally` runs whether the pull resolves or rejects, so a failed pull
+    // leaves nothing behind — the next caller starts a fresh one (A7).
+    const pull = this.fetchNormalsTable(latitude, longitude, cacheKey).finally(() => {
+      this.normalsTableInFlight.delete(cacheKey);
+    });
+    this.normalsTableInFlight.set(cacheKey, pull);
+
+    return pull;
+  }
+
+  /**
+   * Fetch and compute one location's full-year normals table, with a single
+   * bounded retry on a rate limit (D3). A second 429 — and every non-429
+   * error, immediately — propagates unchanged to the call site's existing
+   * catch, so normals stay garnish and never fail the parent response.
+   * @private
+   */
+  private async fetchNormalsTable(
+    latitude: number,
+    longitude: number,
+    cacheKey: string
+  ): Promise<NormalsTable> {
+    const redacted = redactCoordinatesForLogging(latitude, longitude);
+    logger.info('Fetching one full year of historical data for climate normals table', {
+      ...redacted
+    });
+
+    // Fetch the full 30-year climate normals period (1991-2020) in one pull.
+    const params: Record<string, string | number> = {
+      latitude,
+      longitude,
+      start_date: '1991-01-01',
+      end_date: '2020-12-31',
+      daily: 'temperature_2m_max,temperature_2m_min,precipitation_sum',
+      timezone: 'UTC' // Use UTC for consistency
+    };
+
+    try {
+      let response: OpenMeteoHistoricalResponse;
+      try {
+        response = await this.makeRequest<OpenMeteoHistoricalResponse>('/archive', params);
+      } catch (error) {
+        if (!(error instanceof RateLimitError)) {
+          throw error;
+        }
+
+        logger.warn('Climate normals archive pull rate-limited, retrying once', {
+          ...redacted,
+          service: 'OpenMeteo'
+        });
+
+        const delay = NORMALS_RETRY_DELAY_MS + Math.random() * NORMALS_RETRY_JITTER_MS;
+        await new Promise(resolve => setTimeout(resolve, delay));
+
+        // A second 429 propagates — one retry is the whole budget.
+        response = await this.makeRequest<OpenMeteoHistoricalResponse>('/archive', params);
+      }
+
+      const table = computeNormalsTable(response);
+
+      if (CacheConfig.enabled) {
+        this.cache.set(cacheKey, table, CacheConfig.ttl.normals);
+      }
+
+      const successRedacted = redactCoordinatesForLogging(latitude, longitude);
+      logger.info('Climate normals table computed successfully', { ...successRedacted });
+
+      return table;
+    } catch (error) {
+      logger.error('Failed to compute climate normals table', error as Error);
+      throw error;
+    }
+  }
+}

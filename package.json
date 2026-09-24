@@ -1,0 +1,26 @@
+{
+  "name": "adk-weather-armoriq",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Google ADK (TypeScript) weather agent, secured with ArmorIQ. DevRel teaching repo.",
+  "scripts": {
+    "start": "tsx src/agent.ts",
+    "typecheck": "tsc --noEmit",
+    "mcp:build": "npm --prefix mcp/weather-mcp ci --no-audit --no-fund && npm --prefix mcp/weather-mcp run build",
+    "mcp:http": "ENABLED_TOOLS=standard supergateway --stdio \"node mcp/weather-mcp/dist/index.js\" --outputTransport streamableHttp --streamableHttpPath /mcp --stateful --sessionTimeout 300000 --healthEndpoint /healthz --port 8080"
+  },
+  "dependencies": {
+    "@armoriq/sdk": "^0.6.10",
+    "@google/adk": "^2.1.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@google/adk-devtools": "^2.1.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "supergateway": "4.0.0"
+  }
+}

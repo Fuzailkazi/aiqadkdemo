@@ -1,0 +1,335 @@
+/**
+ * Custom error classes for better error handling and logging
+ */
+
+/**
+ * Closed set of services that can raise a sanitized ApiError
+ */
+export type ApiServiceName =
+  | 'NOAA'
+  | 'OpenMeteo'
+  | 'NCEI'
+  | 'RainViewer'
+  | 'Nominatim'
+  | 'AviationWeather';
+
+/**
+ * Base error class for API-related errors
+ */
+export class ApiError extends Error {
+  public readonly statusCode: number;
+  public readonly service: ApiServiceName;
+  public readonly userMessage: string;
+  public readonly helpLinks: string[];
+  public readonly isRetryable: boolean;
+
+  constructor(
+    message: string,
+    statusCode: number,
+    service: ApiServiceName,
+    userMessage: string,
+    helpLinks: string[] = [],
+    isRetryable: boolean = false
+  ) {
+    super(message);
+    this.name = 'ApiError';
+    this.statusCode = statusCode;
+    this.service = service;
+    this.userMessage = userMessage;
+    this.helpLinks = helpLinks;
+    this.isRetryable = isRetryable;
+
+    // Maintains proper stack trace for where our error was thrown (only available on V8)
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, this.constructor);
+    }
+  }
+
+  /**
+   * Format error for display to user
+   */
+  toUserMessage(): string {
+    let message = `${this.service} API Error: ${this.userMessage}`;
+
+    if (this.helpLinks.length > 0) {
+      message += '\n\nFor more information:\n';
+      this.helpLinks.forEach(link => {
+        message += `- ${link}\n`;
+      });
+    }
+
+    return message;
+  }
+}
+
+/**
+ * Rate limit error - too many requests
+ */
+export class RateLimitError extends ApiError {
+  public readonly retryAfter?: number;
+
+  constructor(service: ApiServiceName, messageOrRetryAfter?: string | number, retryAfter?: number) {
+    // Handle backwards compatibility: if second param is number, treat it as retryAfter
+    let message: string | undefined;
+    let retry: number | undefined;
+
+    if (typeof messageOrRetryAfter === 'number') {
+      message = undefined;
+      retry = messageOrRetryAfter;
+    } else if (typeof messageOrRetryAfter === 'string') {
+      message = messageOrRetryAfter;
+      retry = retryAfter;
+    }
+
+    const userMessage = message || (retry
+      ? `Rate limit exceeded. Please retry after ${retry} seconds.`
+      : 'Rate limit exceeded. Please retry in a few seconds.');
+
+    super(
+      `Rate limit exceeded for ${service}`,
+      429,
+      service,
+      userMessage,
+      [
+        'https://weather.gov/documentation/services-web-api',
+        'https://open-meteo.com/en/features#api-documentation',
+        'https://www.ncdc.noaa.gov/cdo-web/webservices'
+      ],
+      true // Retryable after waiting
+    );
+
+    this.name = 'RateLimitError';
+    this.retryAfter = retry;
+  }
+}
+
+/**
+ * Service unavailable error - API is down or timing out
+ */
+export class ServiceUnavailableError extends ApiError {
+  constructor(service: ApiServiceName, messageOrError?: string | Error, originalError?: Error) {
+    // Handle backwards compatibility: if second param is Error, treat it as originalError
+    let message: string | undefined;
+    let error: Error | undefined;
+
+    if (typeof messageOrError === 'string') {
+      message = messageOrError;
+      error = originalError;
+    } else if (messageOrError instanceof Error) {
+      message = undefined;
+      error = messageOrError;
+    }
+
+    const userMessage = message || `The ${service} weather service is temporarily unavailable. Please try again in a few minutes.`;
+    const helpLink = service === 'NOAA' ? 'https://www.weather.gov/'
+      : service === 'NCEI' ? 'https://www.ncei.noaa.gov/'
+      : service === 'RainViewer' ? 'https://www.rainviewer.com/'
+      : 'https://open-meteo.com/';
+
+    super(
+      `${service} API is currently unavailable`,
+      503,
+      service,
+      userMessage,
+      [helpLink],
+      true // Retryable
+    );
+
+    this.name = 'ServiceUnavailableError';
+
+    if (error && error.stack) {
+      this.stack = `${this.stack}\nCaused by: ${error.stack}`;
+    }
+  }
+}
+
+/**
+ * Invalid location error - coordinates not supported or out of range
+ */
+export class InvalidLocationError extends ApiError {
+  public readonly latitude?: number;
+  public readonly longitude?: number;
+
+  constructor(
+    service: ApiServiceName,
+    message: string,
+    latitude?: number,
+    longitude?: number
+  ) {
+    super(
+      message,
+      400,
+      service,
+      message,
+      [],
+      false // Not retryable
+    );
+
+    this.name = 'InvalidLocationError';
+    this.latitude = latitude;
+    this.longitude = longitude;
+  }
+}
+
+/**
+ * Data not found error - requested data doesn't exist
+ */
+export class DataNotFoundError extends ApiError {
+  constructor(service: ApiServiceName, message: string) {
+    super(
+      message,
+      404,
+      service,
+      message,
+      [],
+      false // Not retryable
+    );
+
+    this.name = 'DataNotFoundError';
+  }
+}
+
+/**
+ * Validation error - invalid input parameters
+ */
+export class ValidationError extends Error {
+  public readonly field?: string;
+  public readonly value?: any;
+
+  constructor(message: string, field?: string, value?: any) {
+    super(message);
+    this.name = 'ValidationError';
+    this.field = field;
+    this.value = value;
+
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, this.constructor);
+    }
+  }
+}
+
+/**
+ * The user-facing text shown when the optional `mqtt` package is absent.
+ *
+ * This single string reaches the user through three surfaces, so it is defined
+ * once and never reworded per-surface:
+ *   1. `get_lightning_activity` — as `Error: <this>` via `formatErrorForUser`
+ *   2. `get_weather_summary` — inline in its `## lightning (unavailable)` section
+ *   3. `docs/ERROR_HANDLING.md` — quoted verbatim
+ *
+ * It names the package, states plainly that it is not installed, and gives the
+ * remedy. It carries no file path and no stack: the reader needs the fix, not
+ * our node_modules layout.
+ */
+export const MQTT_UNAVAILABLE_MESSAGE =
+  'This server was installed without the optional "mqtt" package, which lightning ' +
+  'detection requires. Reinstall without --omit=optional ' +
+  '(e.g. npm install -g @dangahagan/weather-mcp) to enable it.';
+
+/**
+ * The optional `mqtt` package could not be resolved.
+ *
+ * Deliberately a plain `Error` and **not** an `ApiError`: `ApiServiceName` is a
+ * closed union that does not include Blitzortung, and this is a local packaging
+ * state rather than an upstream service failure. `formatErrorForUser` has no
+ * branch for it, so it falls through to the generic sanitiser and the user sees
+ * `Error: <message>`.
+ *
+ * This is a **contract** failure, not garnish. Lightning is safety data, so an
+ * absent module must never degrade into an empty strike list — that would render
+ * as an all-clear built from a missing dependency.
+ */
+export class MqttUnavailableError extends Error {
+  constructor(message: string = MQTT_UNAVAILABLE_MESSAGE) {
+    super(message);
+    this.name = 'MqttUnavailableError';
+
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, this.constructor);
+    }
+  }
+}
+
+/**
+ * The user-facing text shown when the optional `mqtt` package is installed but
+ * cannot be loaded.
+ *
+ * A different state from `MQTT_UNAVAILABLE_MESSAGE`, and deliberately a
+ * different message: telling someone to reinstall without `--omit=optional`
+ * when they never omitted it sends them after the wrong fix. Reaches the same
+ * two surfaces (`get_lightning_activity`, `get_weather_summary`).
+ *
+ * Fixed text with no path and no stack — the underlying failure can carry a
+ * `Require stack:` of absolute paths, and none of that belongs in a tool result.
+ */
+export const MQTT_LOAD_FAILED_MESSAGE =
+  'The optional "mqtt" package is installed but could not be loaded, so lightning ' +
+  'detection is unavailable. This usually means a damaged or partial install; ' +
+  'reinstalling the server (e.g. npm install -g @dangahagan/weather-mcp) repairs it.';
+
+/**
+ * The optional `mqtt` package resolved but failed to load.
+ *
+ * Distinct from {@link MqttUnavailableError} so the two remedies stay distinct,
+ * but the same **contract** posture: lightning is safety data, and a module that
+ * failed to load is not an empty feed. Without this, the loader's "real fault"
+ * rethrow fell through `getLightningStrikes`'s generic catch to `return []` and
+ * rendered a green safety verdict built from a broken dependency — verified
+ * against the built dist with a corrupted `mqtt` and with one of its transitive
+ * dependencies removed.
+ *
+ * Note that a corrupt CommonJS package reports `MODULE_NOT_FOUND`, not
+ * `ERR_MODULE_NOT_FOUND`, so it never reaches the absence branch — see
+ * `loadMqtt` in `src/services/blitzortung.ts`.
+ */
+export class MqttLoadFailedError extends Error {
+  constructor(message: string = MQTT_LOAD_FAILED_MESSAGE) {
+    super(message);
+    this.name = 'MqttLoadFailedError';
+
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, this.constructor);
+    }
+  }
+}
+
+/**
+ * Check if an error is retryable
+ */
+export function isRetryableError(error: Error): boolean {
+  if (error instanceof ApiError) {
+    return error.isRetryable;
+  }
+
+  // Network errors are generally retryable
+  if (
+    error.message.includes('ECONNREFUSED') ||
+    error.message.includes('ETIMEDOUT') ||
+    error.message.includes('ENOTFOUND')
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Format error for user display
+ */
+export function formatErrorForUser(error: Error): string {
+  if (error instanceof ApiError) {
+    return error.toUserMessage();
+  }
+
+  if (error instanceof ValidationError) {
+    return `Validation Error: ${error.message}`;
+  }
+
+  // Sanitize generic errors to avoid leaking sensitive information
+  const sanitizedMessage = error.message
+    .replace(/ECONNREFUSED/, 'Connection refused')
+    .replace(/ETIMEDOUT/, 'Connection timed out')
+    .replace(/ENOTFOUND/, 'Service not found');
+
+  return `Error: ${sanitizedMessage}`;
+}
