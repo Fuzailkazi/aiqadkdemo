@@ -41,11 +41,7 @@ services:
     region: singapore
     # Dev dependencies on purpose: the `adk` CLI lives in @google/adk-devtools.
     buildCommand: npm ci --include=dev
-    # The MCP's public URL is https://<its slug>.onrender.com/mcp. If Render
-    # gives it a different domain, set WEATHER_MCP_URL in the dashboard instead.
-    startCommand: >-
-      WEATHER_MCP_URL="${WEATHER_MCP_URL:-https://$WEATHER_MCP_SLUG.onrender.com/mcp}"
-      npx adk web agents --host 0.0.0.0 --port $PORT
+    startCommand: npx adk web agents --host 0.0.0.0 --port $PORT
     buildFilter:
       ignoredPaths:
         - mcp/**
@@ -53,11 +49,11 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "22"
-      - key: WEATHER_MCP_SLUG
-        fromService:
-          type: web
-          name: weather-mcp
-          property: slug
+      # The MCP's public URL + /mcp, e.g. https://weather-mcp.onrender.com/mcp
+      # (Render asks for it when you create the Blueprint; if the MCP ends up
+      # on a different domain, fix it under the agent's Environment tab).
+      - key: WEATHER_MCP_URL
+        sync: false
       # Same token the MCP generated; the agent sends it as a bearer header.
       - key: WEATHER_MCP_TOKEN
         fromService:
