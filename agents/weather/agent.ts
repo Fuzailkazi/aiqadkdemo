@@ -1,16 +1,4 @@
-/**
- * Same weather agent as src/agent.ts, shaped for `adk web` (Google ADK's
- * own dev UI) instead of a terminal chat loop.
- *
- * IMPORTANT DIFFERENCE from src/agent.ts:
- * `adk web` owns the runner and session lifecycle itself — it calls
- * rootAgent directly, per browser tab, with no hook for us to run code
- * before/after each turn. So instead of the correct pattern (a fresh
- * scope.install()/uninstall() per request, per user — see src/agent.ts),
- * ArmorIQ is installed ONCE here, at module load, for one fixed user.
- * That's fine for watching enforcement happen live in the UI, but it's
- * not how you'd wire this into a real multi-user app.
- */
+
 import 'dotenv/config';
 import * as path from 'node:path';
 import { LlmAgent, MCPToolset } from '@google/adk';
@@ -28,21 +16,21 @@ const USER_EMAIL = process.env.USER_EMAIL!;
 const weatherTools = new MCPToolset(
   process.env.WEATHER_MCP_URL
     ? {
-        type: 'StreamableHTTPConnectionParams',
-        url: process.env.WEATHER_MCP_URL,
-        // Deployed MCP (mcp/weather-mcp/serve.mjs) rejects calls without this token.
-        ...(process.env.WEATHER_MCP_TOKEN && {
-          transportOptions: { requestInit: { headers: { Authorization: `Bearer ${process.env.WEATHER_MCP_TOKEN}` } } },
-        }),
-      }
+      type: 'StreamableHTTPConnectionParams',
+      url: process.env.WEATHER_MCP_URL,
+      // Deployed MCP (mcp/weather-mcp/serve.mjs) rejects calls without this token.
+      ...(process.env.WEATHER_MCP_TOKEN && {
+        transportOptions: { requestInit: { headers: { Authorization: `Bearer ${process.env.WEATHER_MCP_TOKEN}` } } },
+      }),
+    }
     : {
-        type: 'StdioConnectionParams',
-        serverParams: {
-          command: 'node',
-          args: [path.resolve('mcp/weather-mcp/dist/index.js')],
-          env: { ...process.env, ENABLED_TOOLS: 'standard' },
-        },
+      type: 'StdioConnectionParams',
+      serverParams: {
+        command: 'node',
+        args: [path.resolve('mcp/weather-mcp/dist/index.js')],
+        env: { ...process.env, ENABLED_TOOLS: 'standard' },
       },
+    },
 );
 
 export const rootAgent = new LlmAgent({
