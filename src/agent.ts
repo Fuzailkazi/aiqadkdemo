@@ -50,16 +50,16 @@ const session = await runner.sessionService.createSession({ appName: 'weather-de
 const armoriq = new ArmorIQADK({ apiKey: process.env.ARMORIQ_API_KEY!, defaultMcpName: 'weather' });
 
 async function ask(userMessage: string): Promise<void> {
-  const scope = await armoriq.forUser(USER_EMAIL, { goal: userMessage });
+  const request = await armoriq.forUser(USER_EMAIL, { goal: userMessage });
 
-  scope.install(rootAgent); // enforce allow/hold/block on every tool call this turn
+  request.install(rootAgent); // enforce allow/hold/block on every tool call this turn
   try {
     for await (const event of runner.runAsync({ userId: USER_EMAIL, sessionId: session.id, newMessage: { parts: [{ text: userMessage }] } })) {
       printEvent(event);
     }
   } finally {
-    scope.uninstall(rootAgent); // stop enforcing
-    await scope.close();        // send this turn's record to ArmorIQ
+    request.uninstall(rootAgent); // stop enforcing
+    await request.close();        // send this turn's record to ArmorIQ
   }
 }
 

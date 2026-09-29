@@ -1,31 +1,57 @@
-# Talking points — ArmorIQ + Google ADK
+# Script — ArmorIQ + Google ADK
 
-Don't read word for word. Hit these points, in your own words, with
-`src/agent.ts` on screen.
+Read straight through. `src/agent.ts` on screen the whole time.
 
-1. **One-time setup:** you create ArmorIQ once, with your API key.
+---
 
-2. **Per message:** you tell it who's asking, and what they're asking for.
+**Show:**
+```typescript
+const armoriq = new ArmorIQADK({ apiKey: process.env.ARMORIQ_API_KEY! });
+```
+**Say:**
+> "This sets up ArmorIQ once, when the app starts. Just your API key."
 
-3. **`install()` — this is the important line, spend most of your time here.**
+---
 
-   Every Google ADK agent already has two built-in moments in its own
-   code — a spot that runs **right before** it uses a tool, and a spot that
-   runs **right after**. Normally both are empty; nothing happens there.
+**Show:**
+```typescript
+const request = await armoriq.forUser(USER_EMAIL, { goal: userMessage });
+```
+**Say:**
+> "This line creates a request — who's asking, and what they want. ArmorIQ
+> needs that upfront, so every tool call afterward gets checked against it,
+> and every decision is attributed to a real person."
 
-   `install()` fills those two spots in:
-   - **Before** a tool runs, ArmorIQ checks it — allow it, hold it for
-     approval, or block it.
-   - **After** a tool runs, ArmorIQ records what happened.
+---
 
-   That's the whole integration. Nothing about the agent or its tools
-   changes — ArmorIQ is just sitting in two spots that were already there,
-   waiting to be used.
+**Show:**
+```typescript
+request.install(rootAgent);
+```
+**Say:**
+> "This next line is the important one. Here's what happens every time you
+> send a message: Gemini responds — and right after that, ArmorIQ looks at
+> what it said. If Gemini wants to call a tool, right before that tool
+> runs, ArmorIQ checks it — allow, hold, or block. And right after the tool
+> runs, ArmorIQ records what happened.
+>
+> Google ADK already has those checkpoints built in — before a tool runs,
+> and after. This one line just plugs ArmorIQ into them. Nothing about the
+> agent or its tools changes."
 
-4. **`uninstall()` / `close()` — quick, move past this fast:**
-   "And once the message is done, these two just clean up — turn those two
-   spots back off, and tell ArmorIQ the message is finished." One breath,
-   then move on. No need to explain further.
+---
 
-5. **Close:** "That's it. One line, `install()`, is what puts ArmorIQ in
-   front of every tool call this agent makes."
+**Show:**
+```typescript
+request.uninstall(rootAgent);
+await request.close();
+```
+**Say (quick, move on):**
+> "And once the message is done, these two just clean up — turn those
+> checkpoints back off, and tell ArmorIQ the message is finished."
+
+---
+
+**Say (closing):**
+> "That's it. One line, `install`, is what puts ArmorIQ in front of every
+> tool call this agent makes."
